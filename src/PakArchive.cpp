@@ -483,7 +483,6 @@ namespace
 		if ((entry.type & PakTypeEncrypted) != 0)
 		{
 			const size_t topBytes = std::min({
-				static_cast<size_t>(entry.realSize),
 				data.size(),
 				DataBlockSize
 			});
@@ -511,8 +510,9 @@ namespace
 
 		if ((entry.type & PakTypeEncrypted) != 0)
 		{
+			// The top encryption layer covers padded storage bytes, not only
+			// real file bytes. Decrypt first, then trim padding by realSize.
 			const size_t topBytes = std::min({
-				static_cast<size_t>(entry.realSize),
 				encryptedData.size(),
 				DataBlockSize
 			});

@@ -235,7 +235,6 @@ namespace
 
 		// Match the production packer: top block first, then the whole payload.
 		const size_t topBytes = std::min({
-			static_cast<size_t>(entry.realSize),
 			storedData.size(),
 			DataBlockSize
 		});
