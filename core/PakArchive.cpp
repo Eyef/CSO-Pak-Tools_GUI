@@ -19,9 +19,9 @@ namespace
 	constexpr std::u16string_view PakKey = u"CqeLFV@*0IfewH(";
 	constexpr uint8_t PakVersion = 2;
 	// The compressed flag is recognized only to reject unsupported entries for now.
-	constexpr uint32_t PakTypeCompressed = 0x1;
-	constexpr uint32_t PakTypeEncrypted = 0x2;
-	constexpr uint32_t PakTypeEncryptedAgain = 0x4;
+	constexpr uint32_t PakTypeCompressed = EntryTypeCompressed;
+	constexpr uint32_t PakTypeEncrypted = EntryTypeEncrypted;
+	constexpr uint32_t PakTypeEncryptedAgain = EntryTypeEncryptedAgain;
 	constexpr uint32_t MaxPathChars = 16384;
 	constexpr size_t HeaderSize = 0xC;
 	constexpr size_t DataBlockSize = 0x400;
@@ -838,6 +838,14 @@ PackStats PakArchive::PackDirectory(const std::filesystem::path &inputRoot,
 	auto output = BuildOutputPak(outputFilename, packedEntries, dataBlockCount);
 	WriteFile(outputPakPath, output);
 	return stats;
+}
+
+std::vector<uint8_t> PakArchive::ExtractEntry(const Entry &entry) const
+{
+	// Same steps as UnpackToDirectory for one entry, kept in memory instead
+	// of being written to disk. Used by preview/browsing tools.
+	auto encryptedData = CopyOriginalBlob(buffer_, dataStartOffset_, entry);
+	return DecryptEntryData(entry, std::move(encryptedData));
 }
 
 PatchStats PakArchive::PatchFromDirectory(const std::filesystem::path &replacementRoot,
