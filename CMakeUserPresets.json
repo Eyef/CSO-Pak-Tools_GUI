@@ -1,0 +1,14 @@
+﻿{
+  "version": 4,
+  "configurePresets": [
+    {
+      "name": "default",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "F:/Qt/6.11.1/msvc2022_64",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ]
+}
