@@ -98,8 +98,6 @@ void main()
 		yaw_ = -90.0f;
 		pitch_ = 20.0f;
 		distance_ = 120.0f;
-		panX_ = 0.0f;
-		panY_ = 0.0f;
 		if (model_)
 		{
 			// Default bodygroup: submodel 0 from every bodypart, as the engine
@@ -183,6 +181,16 @@ void main()
 		update();
 	}
 
+	void ModelViewWidget::ResetView()
+	{
+		// Same default orbit angle SetModel() starts a fresh model at (see
+		// the comment there about why -90/20, not 0/20).
+		yaw_ = -90.0f;
+		pitch_ = 20.0f;
+		ComputeBounds(/*resetDistance=*/true); // Reads from model_ geometry directly, so this is unaffected by any pan drift.
+		update();
+	}
+
 	bool ModelViewWidget::IsTextureAdditive(int textureIndex) const
 	{
 		return AdditiveSourceFor(textureIndex) != AdditiveSource::None;
@@ -207,7 +215,7 @@ void main()
 		// file's own STUDIO_NF_ADDITIVE flag isn't set.
 		const QString name = QString::fromStdString(tex.name);
 		if (name.startsWith(QStringLiteral("$0a_"), Qt::CaseInsensitive) ||
-			name.startsWith(QStringLiteral("$0b_"), Qt::CaseInsensitive))
+			name.startsWith(QStringLiteral("$0b"), Qt::CaseInsensitive))
 			return AdditiveSource::NamePrefix;
 
 		return AdditiveSource::None;
@@ -570,8 +578,6 @@ void main()
 
 		QMatrix4x4 view;
 		view.lookAt(eye, centerWorld, QVector3D(0, 0, 1));
-		// Pan in screen space (camera X = screen right, camera Y = screen up).
-		view.translate(panX_, panY_, 0.0f);
 
 		const QMatrix4x4 mvp = projection * view * model;
 		bool invertible = false;
@@ -728,10 +734,37 @@ void main()
 		}
 		else if (panning_)
 		{
-			// Pan in screen units; scale by distance so the feel is stable.
+			// Pan by moving the orbit pivot itself, using the camera's
+			// *current* right/up basis (recomputed from yaw_/pitch_, not
+			// just valid at the default angle) -- not a separate, decoupled
+			// view-space offset. That old approach only matched "pan in
+			// screen space" at yaw=pitch=0; at any other orbit angle it
+			// translated the scene along the wrong (world, not camera) axes,
+			// and since it never moved the actual pivot, orbiting afterward
+			// (left-drag) would swing the view right back away from wherever
+			// panning had put things on screen. Moving the pivot directly
+			// fixes both: pan tracks the mouse at any angle, and subsequent
+			// orbiting continues around wherever you just panned to.
+			const float pitchRad = qDegreesToRadians(pitch_);
+			const float yawRad = qDegreesToRadians(yaw_);
+			const float cp = std::cos(pitchRad);
+			QVector3D dirToCamera(cp * std::cos(yawRad), cp * std::sin(yawRad), std::sin(pitchRad));
+			dirToCamera.normalize();
+			const QVector3D forward = -dirToCamera;
+			const QVector3D worldUp(0.0f, 0.0f, 1.0f);
+			QVector3D right = QVector3D::crossProduct(forward, worldUp);
+			if (right.lengthSquared() < 1e-8f) // Looking straight up/down: worldUp is degenerate, pick any right.
+				right = QVector3D(0.0f, 1.0f, 0.0f);
+			right.normalize();
+			const QVector3D camUp = QVector3D::crossProduct(right, forward).normalized();
+
+			// Scale by distance so the drag-to-motion feel stays consistent
+			// whether zoomed in close or looking at the whole scene.
 			const float scale = distance_ * 0.0016f;
-			panX_ += delta.x() * scale;
-			panY_ -= delta.y() * scale;
+			const QVector3D offset = -right * (delta.x() * scale) + camUp * (delta.y() * scale);
+			centerX_ += offset.x();
+			centerY_ += offset.y();
+			centerZ_ += offset.z();
 			update();
 		}
 	}
@@ -748,7 +781,15 @@ void main()
 	{
 		const int delta = event->angleDelta().y();
 		distance_ *= (delta > 0) ? 0.9f : 1.1f;
-		distance_ = std::clamp(distance_, radius_ * 0.5f, radius_ * 20.0f);
+		// The minimum used to be radius_*0.5 -- fine for a single compact
+		// model, but radius_ is the bounding radius of *everything* in the
+		// file. For a model with far-apart pieces (e.g. a boss standing
+		// well away from its own attack-effect meshes), that alone could
+		// keep you from ever zooming in close on just one part. Scale the
+		// floor down a lot instead, with a small absolute minimum so it's
+		// never degenerate.
+		const float minDistance = std::max(radius_ * 0.02f, 0.5f);
+		distance_ = std::clamp(distance_, minDistance, radius_ * 20.0f);
 		update();
 	}
 }
