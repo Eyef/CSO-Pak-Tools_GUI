@@ -55,6 +55,13 @@ namespace cso_gui
 		bool Wireframe() const { return wireframe_; }
 		void SetWireframe(bool enabled);
 
+		// Recomputes the pivot/radius/distance fresh from the model's own
+		// geometry and restores the default orbit angle, discarding any
+		// pan/orbit/zoom drift from this viewing session. Useful after
+		// panning gets a multi-piece model's camera lost (see the pan
+		// comment in mouseMoveEvent for why that could happen).
+		void ResetView();
+
 		// Where a texture's additive-render decision came from.
 		enum class AdditiveSource
 		{
@@ -156,8 +163,6 @@ namespace cso_gui
 		float pitch_ = 20.0f;
 		float distance_ = 120.0f;
 		float modelScale_ = 1.0f;
-		float panX_ = 0.0f;
-		float panY_ = 0.0f;
 		QPoint lastMouse_;
 		bool dragging_ = false;
 		bool panning_ = false;
