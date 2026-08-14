@@ -168,8 +168,20 @@ whole step.
     them too, not just decrypted `.cso` ones.
   - `.mdl` → parsed with `StudioModel` and shown in an interactive 3D viewer
     (`ModelViewWidget`, OpenGL): orbit with left-drag, pan with right-drag,
-    zoom with the wheel. The side panel lets you pick a submodel per
-    bodypart, switch skin families, toggle wireframe, and play back
+    zoom with the wheel. Right-drag pan moves the actual orbit pivot using
+    the camera's *current* right/up directions (recomputed from the live
+    yaw/pitch every drag) rather than a fixed offset that was only correct
+    at the default angle — panning after rotating the camera used to send
+    the pivot somewhere unrelated to what was on screen, which made models
+    with far-apart pieces (a boss standing well away from its own
+    attack-effect meshes, for instance) hard to frame. Zooming in is no
+    longer capped by the *whole* model's bounding radius either, so you can
+    get close to one small part of a spread-out model instead of stopping
+    short because something else in the file is far away. A **Reset View
+    (camera)** button next to Lighting re-frames from the model's geometry
+    from scratch if you still get the camera lost. The side panel lets you
+    pick a submodel per bodypart, switch skin families, toggle wireframe,
+    and play back
     sequences (animations) at the sequence's own fps with a scrub slider.
     Lighting is two camera-attached lights (a key light from the upper
     right, plus a dimmer fill from the lower left purely *added* on top —
