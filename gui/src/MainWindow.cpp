@@ -303,6 +303,15 @@ void MainWindow::BuildUi()
 	modelAnimTimer_ = new QTimer(this);
 	connect(modelAnimTimer_, &QTimer::timeout, this, &MainWindow::OnModelAnimationTick);
 
+	// Reset View is separate from the Lighting box's own Reset (camera vs.
+	// light), also persistent for the same reason. Panning with the fix
+	// above should no longer lose track of the model, but some multi-piece
+	// files (a boss far from its own attack-effect meshes, etc.) are still
+	// awkward to frame by hand, so this is a one-click way back to the
+	// same auto-framed view SetModel() starts a fresh model at.
+	auto *resetViewButton = new QPushButton(tr("Reset View (camera)"));
+	connect(resetViewButton, &QPushButton::clicked, this, [this]() { modelView_->ResetView(); });
+
 	// Lighting controls are deliberately a *persistent* panel (built once,
 	// here) rather than living inside modelControlsContainer_, which gets
 	// torn down and rebuilt from scratch every time a different model
@@ -333,6 +342,7 @@ void MainWindow::BuildUi()
 	auto *modelRightPanel = new QWidget;
 	auto *modelRightPanelLayout = new QVBoxLayout(modelRightPanel);
 	modelRightPanelLayout->setContentsMargins(0, 0, 0, 0);
+	modelRightPanelLayout->addWidget(resetViewButton);
 	modelRightPanelLayout->addWidget(lightBox);
 	modelRightPanelLayout->addWidget(modelControlsScroll, 1);
 
