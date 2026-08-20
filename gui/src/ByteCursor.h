@@ -57,6 +57,18 @@ namespace cso_gui
 			return p;
 		}
 
+		// Jumps to an absolute offset, e.g. to read a directory/table that
+		// sits somewhere other than right at the start of the file.
+		void Seek(size_t offset)
+		{
+			if (offset > data_.size())
+				throw std::runtime_error("seek past end of file");
+			offset_ = offset;
+		}
+
+		size_t Offset() const { return offset_; }
+		size_t Size() const { return data_.size(); }
+
 	private:
 		static uint32_t ReadU32(const uint8_t *p)
 		{
