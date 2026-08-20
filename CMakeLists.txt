@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.21)
 project(cso_pak_tool LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -61,6 +61,8 @@ add_executable(cso-pak-gui WIN32
 	gui/src/DxtDecompress.cpp
 	gui/src/DdsImage.h
 	gui/src/DdsImage.cpp
+	gui/src/Wad3Archive.h
+	gui/src/Wad3Archive.cpp
 )
 target_link_libraries(cso-pak-gui PRIVATE cso_pak_core Qt6::Widgets Qt6::Multimedia Qt6::MultimediaWidgets Qt6::OpenGL Qt6::OpenGLWidgets OpenGL::GL)
 
