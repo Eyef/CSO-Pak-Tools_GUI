@@ -214,7 +214,7 @@ void main()
 		// consistently black-background effect textures, even when the
 		// file's own STUDIO_NF_ADDITIVE flag isn't set.
 		const QString name = QString::fromStdString(tex.name);
-		if (name.startsWith(QStringLiteral("$0a_"), Qt::CaseInsensitive) ||
+		if (name.startsWith(QStringLiteral("$0a"), Qt::CaseInsensitive) ||
 			name.startsWith(QStringLiteral("$0b"), Qt::CaseInsensitive))
 			return AdditiveSource::NamePrefix;
 
