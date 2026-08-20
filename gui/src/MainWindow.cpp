@@ -786,6 +786,12 @@ void MainWindow::OnCurrentChanged(const QModelIndex &current, const QModelIndex 
 		return;
 	}
 
+	if (model_->IsWadLump(current))
+	{
+		ShowWadLumpPreview(model_->WadArchiveIndexForIndex(current), model_->WadEntryIndexForIndex(current));
+		return;
+	}
+
 	const int entryIndex = model_->EntryIndexForIndex(current);
 	if (entryIndex < 0)
 	{
@@ -1806,16 +1812,27 @@ void MainWindow::OnSpriteAnimationTick()
 	spriteAnimTimer_->start(std::max(10, static_cast<int>(interval * 1000.0f)));
 }
 
-void MainWindow::ShowProperties(const cso_pak::PakArchive::Entry &entry, const QString &note)
+void MainWindow::ShowGenericProperties(const QList<QPair<QString, QString>> &rows)
 {
 	propertiesPage_->setRowCount(0);
 
-	const auto addRow = [this](const QString &property, const QString &value)
+	for (const auto &row : rows)
 	{
-		const int row = propertiesPage_->rowCount();
-		propertiesPage_->insertRow(row);
-		propertiesPage_->setItem(row, 0, new QTableWidgetItem(property));
-		propertiesPage_->setItem(row, 1, new QTableWidgetItem(value));
+		const int r = propertiesPage_->rowCount();
+		propertiesPage_->insertRow(r);
+		propertiesPage_->setItem(r, 0, new QTableWidgetItem(row.first));
+		propertiesPage_->setItem(r, 1, new QTableWidgetItem(row.second));
+	}
+
+	stack_->setCurrentWidget(propertiesPage_);
+}
+
+void MainWindow::ShowProperties(const cso_pak::PakArchive::Entry &entry, const QString &note)
+{
+	QList<QPair<QString, QString>> rows;
+	const auto addRow = [&rows](const QString &property, const QString &value)
+	{
+		rows.append({ property, value });
 	};
 
 	const QString path = QString::fromStdU16String(entry.path);
@@ -1838,7 +1855,62 @@ void MainWindow::ShowProperties(const cso_pak::PakArchive::Entry &entry, const Q
 	if (!note.isEmpty())
 		addRow(tr("Note"), note);
 
-	stack_->setCurrentWidget(propertiesPage_);
+	ShowGenericProperties(rows);
+}
+
+void MainWindow::ShowWadLumpProperties(const cso_gui::WadEntry &lump, const QString &note)
+{
+	QList<QPair<QString, QString>> rows;
+	rows.append({ tr("Name"), QString::fromStdString(lump.name) });
+	rows.append({ tr("Size"), FormatSize(lump.diskSize) });
+	rows.append({ tr("Type byte"), QStringLiteral("0x%1").arg(lump.type, 2, 16, QLatin1Char('0')).toUpper() });
+	rows.append({ tr("Compressed"), lump.compressed ? tr("yes (unsupported)") : tr("no") });
+	if (!note.isEmpty())
+		rows.append({ tr("Note"), note });
+
+	ShowGenericProperties(rows);
+}
+
+void MainWindow::ShowWadLumpPreview(int wadArchiveIndex, int wadEntryIndex)
+{
+	StopMediaPlayback();
+	StopModelPlayback();
+	StopSpritePlayback();
+
+	const cso_gui::Wad3Archive *wad = model_->WadArchiveAt(wadArchiveIndex);
+	if (wad == nullptr || wadEntryIndex < 0 || wadEntryIndex >= static_cast<int>(wad->Entries().size()))
+	{
+		ShowPlaceholder(tr("Select a file in the tree to preview it."));
+		return;
+	}
+
+	const auto &lump = wad->Entries()[static_cast<size_t>(wadEntryIndex)];
+
+	std::vector<uint8_t> data;
+	try
+	{
+		data = wad->ExtractEntry(lump);
+	}
+	catch (const std::exception &ex)
+	{
+		ShowWadLumpProperties(lump, tr("Failed to extract this WAD entry: %1").arg(QString::fromUtf8(ex.what())));
+		return;
+	}
+
+	// There's no reliable type-byte value to gate this on (see the comment
+	// on LoadWadMiptex), so just try decoding it as a miptex texture and
+	// fall back to properties if the data doesn't have that shape.
+	try
+	{
+		const QImage image = cso_gui::LoadWadMiptex(data, lump.name);
+		ShowImage(image);
+		return;
+	}
+	catch (const std::exception &)
+	{
+	}
+
+	ShowWadLumpProperties(lump, tr("Not a recognized texture (miptex) lump."));
 }
 
 void MainWindow::ShowPreviewForEntry(const cso_pak::PakArchive::Entry &entry)
@@ -1935,6 +2007,24 @@ void MainWindow::ShowPreviewForEntry(const cso_pak::PakArchive::Entry &entry)
 	if (ext == QLatin1String("spr"))
 	{
 		ShowSprite(entry, data);
+		return;
+	}
+
+	if (ext == QLatin1String("wad"))
+	{
+		try
+		{
+			const auto wad = cso_gui::Wad3Archive::Load(data);
+			QList<QPair<QString, QString>> rows;
+			rows.append({ tr("Format"), wad.IsWad3() ? tr("WAD3 (Half-Life/GoldSource)") : tr("WAD2 (Quake)") });
+			rows.append({ tr("Entries"), QString::number(wad.Entries().size()) });
+			rows.append({ tr("Note"), tr("Expand this file in the tree (arrow on the left) to browse and preview its lumps individually.") });
+			ShowGenericProperties(rows);
+		}
+		catch (const std::exception &ex)
+		{
+			ShowProperties(entry, tr("Failed to parse this WAD archive: %1").arg(QString::fromUtf8(ex.what())));
+		}
 		return;
 	}
 
