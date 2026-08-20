@@ -4,6 +4,7 @@
 #include <iterator>
 
 #include <QApplication>
+#include <QFileInfo>
 #include <QStyle>
 
 PakTreeModel::PakTreeModel(QObject *parent)
@@ -12,6 +13,9 @@ PakTreeModel::PakTreeModel(QObject *parent)
 {
 	folderIcon_ = QApplication::style()->standardIcon(QStyle::SP_DirIcon);
 	fileIcon_ = QApplication::style()->standardIcon(QStyle::SP_FileIcon);
+	// Visually distinct from a plain folder, for a .wad that parsed
+	// successfully and is expandable into its own lumps.
+	wadIcon_ = QApplication::style()->standardIcon(QStyle::SP_DriveCDIcon);
 }
 
 void PakTreeModel::SetArchive(const cso_pak::PakArchive *archive)
@@ -20,6 +24,7 @@ void PakTreeModel::SetArchive(const cso_pak::PakArchive *archive)
 
 	archive_ = archive;
 	root_ = std::make_unique<Node>();
+	wadArchives_.clear();
 
 	if (archive_ != nullptr)
 	{
@@ -39,14 +44,64 @@ void PakTreeModel::SetArchive(const cso_pak::PakArchive *archive)
 			auto fileNode = std::make_unique<Node>();
 			fileNode->name = parts.last();
 			fileNode->parent = current;
+			fileNode->kind = NodeKind::PakFile;
 			fileNode->entryIndex = i;
+			Node *fileNodeRaw = fileNode.get();
 			current->children.push_back(std::move(fileNode));
+
+			AddWadChildrenIfApplicable(fileNodeRaw, i);
 		}
 
 		SortChildrenRecursive(root_.get());
 	}
 
 	endResetModel();
+}
+
+void PakTreeModel::AddWadChildrenIfApplicable(Node *fileNode, int entryIndex)
+{
+	if (archive_ == nullptr)
+		return;
+
+	const QString extension = QFileInfo(fileNode->name).suffix().toLower();
+	if (extension != QLatin1String("wad"))
+		return;
+
+	// A .wad that fails to parse (corrupt, or just not actually a WAD
+	// despite the extension) simply stays a normal, non-expandable file
+	// node -- same "fall back gracefully" approach used for every other
+	// format in this app.
+	try
+	{
+		const auto &entry = archive_->Entries()[static_cast<size_t>(entryIndex)];
+		auto data = archive_->ExtractEntry(entry);
+		auto wad = std::make_unique<cso_gui::Wad3Archive>(cso_gui::Wad3Archive::Load(std::move(data)));
+
+		const int wadArchiveIndex = static_cast<int>(wadArchives_.size());
+		fileNode->wadArchiveIndex = wadArchiveIndex;
+
+		for (int i = 0; i < static_cast<int>(wad->Entries().size()); ++i)
+		{
+			const auto &lump = wad->Entries()[static_cast<size_t>(i)];
+
+			auto lumpNode = std::make_unique<Node>();
+			lumpNode->name = lump.name.empty()
+				? QStringLiteral("(unnamed lump %1)").arg(i)
+				: QString::fromStdString(lump.name);
+			lumpNode->parent = fileNode;
+			lumpNode->kind = NodeKind::WadLump;
+			lumpNode->wadArchiveIndex = wadArchiveIndex;
+			lumpNode->wadEntryIndex = i;
+			fileNode->children.push_back(std::move(lumpNode));
+		}
+
+		wadArchives_.push_back(std::move(wad));
+	}
+	catch (const std::exception &)
+	{
+		fileNode->wadArchiveIndex = -1;
+		fileNode->children.clear();
+	}
 }
 
 PakTreeModel::Node *PakTreeModel::FindOrCreateFolder(Node *parent, const QString &name)
@@ -67,17 +122,25 @@ PakTreeModel::Node *PakTreeModel::FindOrCreateFolder(Node *parent, const QString
 
 void PakTreeModel::SortChildrenRecursive(Node *node)
 {
-	std::ranges::sort(node->children, [](const auto &left, const auto &right)
+	// Folders/files alphabetical, as before -- but WAD-lump children of a
+	// .wad node are left in their original on-disk order rather than
+	// resorted, since that's usually more meaningful for a lump directory
+	// than alphabetical, and they were never mixed with folders/files to
+	// begin with (a .wad node's children are ALL WadLump).
+	if (node->children.empty() || node->children.front()->kind != NodeKind::WadLump)
 	{
-		if (left->IsFolder() != right->IsFolder())
-			return left->IsFolder(); // Folders before files, like Explorer.
+		std::ranges::sort(node->children, [](const auto &left, const auto &right)
+		{
+			if (left->IsFolder() != right->IsFolder())
+				return left->IsFolder(); // Folders before files, like Explorer.
 
-		return QString::compare(left->name, right->name, Qt::CaseInsensitive) < 0;
-	});
+			return QString::compare(left->name, right->name, Qt::CaseInsensitive) < 0;
+		});
+	}
 
 	for (auto &child : node->children)
 	{
-		if (child->IsFolder())
+		if (child->kind != NodeKind::WadLump)
 			SortChildrenRecursive(child.get());
 	}
 }
@@ -93,7 +156,7 @@ PakTreeModel::Node *PakTreeModel::NodeFromIndex(const QModelIndex &index) const
 int PakTreeModel::EntryIndexForIndex(const QModelIndex &index) const
 {
 	const Node *node = NodeFromIndex(index);
-	if (node == nullptr || node == root_.get())
+	if (node == nullptr || node == root_.get() || node->kind != NodeKind::PakFile)
 		return -1;
 
 	return node->entryIndex;
@@ -105,9 +168,44 @@ bool PakTreeModel::IsFolder(const QModelIndex &index) const
 	return node != nullptr && node->IsFolder();
 }
 
+bool PakTreeModel::IsWadLump(const QModelIndex &index) const
+{
+	const Node *node = NodeFromIndex(index);
+	return node != nullptr && node->kind == NodeKind::WadLump;
+}
+
+int PakTreeModel::WadArchiveIndexForIndex(const QModelIndex &index) const
+{
+	const Node *node = NodeFromIndex(index);
+	if (node == nullptr || node->kind != NodeKind::WadLump)
+		return -1;
+
+	return node->wadArchiveIndex;
+}
+
+int PakTreeModel::WadEntryIndexForIndex(const QModelIndex &index) const
+{
+	const Node *node = NodeFromIndex(index);
+	if (node == nullptr || node->kind != NodeKind::WadLump)
+		return -1;
+
+	return node->wadEntryIndex;
+}
+
+const cso_gui::Wad3Archive *PakTreeModel::WadArchiveAt(int wadArchiveIndex) const
+{
+	if (wadArchiveIndex < 0 || wadArchiveIndex >= static_cast<int>(wadArchives_.size()))
+		return nullptr;
+
+	return wadArchives_[static_cast<size_t>(wadArchiveIndex)].get();
+}
+
 void PakTreeModel::CollectEntryIndicesRecursive(const Node *node, std::vector<int> &out)
 {
-	if (!node->IsFolder())
+	if (node->kind == NodeKind::WadLump)
+		return; // Not a real top-level pak entry; nothing to extract it as.
+
+	if (node->kind == NodeKind::PakFile)
 	{
 		out.push_back(node->entryIndex);
 		return;
@@ -185,7 +283,13 @@ QVariant PakTreeModel::data(const QModelIndex &index, int role) const
 		return node->name;
 
 	if (role == Qt::DecorationRole)
-		return node->IsFolder() ? folderIcon_ : fileIcon_;
+	{
+		if (node->IsFolder())
+			return folderIcon_;
+		if (node->kind == NodeKind::PakFile && node->wadArchiveIndex >= 0)
+			return wadIcon_; // Successfully parsed .wad: expandable, distinct icon.
+		return fileIcon_;
+	}
 
 	return QVariant();
 }
