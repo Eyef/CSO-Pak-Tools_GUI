@@ -26,6 +26,7 @@
 #include "PakArchive.h"
 #include "PakTreeModel.h"
 #include "SpriteImage.h"
+#include "Wad3Archive.h"
 #include "StudioModel.h"
 
 class QMenu;
@@ -104,6 +105,9 @@ private:
 	void ShowSprite(const cso_pak::PakArchive::Entry &entry, const std::vector<uint8_t> &data);
 	void StopSpritePlayback();
 	void UpdateSpriteFrameDisplay();
+	void ShowWadLumpPreview(int wadArchiveIndex, int wadEntryIndex);
+	void ShowWadLumpProperties(const cso_gui::WadEntry &lump, const QString &note);
+	void ShowGenericProperties(const QList<QPair<QString, QString>> &rows);
 	void ShowProperties(const cso_pak::PakArchive::Entry &entry, const QString &note = QString());
 	void UpdateImageDisplay();
 
