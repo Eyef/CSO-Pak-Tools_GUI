@@ -28,10 +28,12 @@ project/
         │                            bodygroup/skin selection, wireframe toggle, and sequence playback
         ├── SpriteImage.h/.cpp    decoder for GoldSource/CSO .spr sprites (v2 palette-indexed,
         │                          v3 embedded-DDS DXT5/DXT1/A8), flattened to a per-frame image list
-        ├── ByteCursor.h          shared bounds-checked little-endian reader (.spr, .dds)
+        ├── ByteCursor.h          shared bounds-checked little-endian reader (.spr, .dds, .wad)
         ├── DxtDecompress.h/.cpp  shared DXT1/DXT3/DXT5 block decompression (.spr v3, .dds)
-        └── DdsImage.h/.cpp       standalone .dds decoder: DXT1/DXT3/DXT5 plus common
-                                    uncompressed RGB/RGBA/luminance layouts, mip level 0 only
+        ├── DdsImage.h/.cpp       standalone .dds decoder: DXT1/DXT3/DXT5 plus common
+        │                          uncompressed RGB/RGBA/luminance layouts, mip level 0 only
+        └── Wad3Archive.h/.cpp    WAD2 (Quake)/WAD3 (Half-Life/GoldSource) archive parser plus a
+                                    miptex texture decoder, for .wad files found inside pak archives
 ```
 
 ## What changed in the core files
@@ -138,6 +140,17 @@ whole step.
     for a preview. BC4-7/ATI2 and DX10-extended-header DDS files aren't
     supported and fall back to the properties panel with the reason why.
   - `.png/.jpg/.bmp/.gif/.ppm` → shown natively via Qt in case any turn up.
+  - `.wad` (WAD2/Quake or WAD3/Half-Life-GoldSource — CSO's own are WAD3) is
+    "an archive inside the archive": it shows up in the tree with a
+    distinct icon and an expand arrow, like a folder, with its own lumps as
+    children — no separate extract-then-reopen step needed. Clicking the
+    `.wad` itself shows a summary (format, entry count); clicking a lump
+    tries decoding it as a `miptex` texture (the standard WAD3 format —
+    palette-indexed, with the classic `{`-prefixed-name convention for a
+    transparent cutout color, same idea as studiomdl's masked textures) and
+    falls back to properties (name, size, raw type byte) for anything that
+    isn't. A `.wad` that fails to parse just stays a normal, non-expandable
+    file instead of breaking the rest of the tree.
   - `.wav` and `.webm` → played back with transport controls (play/pause,
     seek slider, elapsed/total time). Both share one `QMediaPlayer`; the
     video area only appears for files that actually have a video track, so
@@ -260,6 +273,12 @@ whole step.
 - Compressed entries (`type & Compressed`) can't be previewed or extracted —
   that was already true of `UnpackToDirectory`; `ExtractEntry` just surfaces
   it as a message instead of a crash.
+- Individual lumps inside a `.wad` can be previewed but not extracted to a
+  file on their own — "Extract Selected" only knows how to pull a real,
+  top-level pak entry out via `PakArchive::ExtractEntry`, and a WAD lump
+  isn't one (it's nested inside the `.wad`'s own bytes). Selecting/extracting
+  the `.wad` file itself works normally and gets you the whole thing,
+  lumps included; picking them apart from there needs a separate tool.
 - Text without a BOM falls back to UTF-8, then Latin-1, if neither decodes
   cleanly. If some of your archives turn out to be Windows-1251 (or another
   8-bit code page) *without* a BOM, add the optional **Qt6 Core5Compat**
