@@ -5,6 +5,8 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
+#include <QElapsedTimer>
 #include <QLabel>
 #include <QMainWindow>
 #include <QMediaPlayer>
@@ -165,6 +167,9 @@ private:
 	QWidget *modelPageContainer_ = nullptr;
 	cso_gui::ModelViewWidget *modelView_ = nullptr;
 	QWidget *modelControlsContainer_ = nullptr;  // rebuilt on every model load
+	QWidget *modelCameraBox_ = nullptr;
+	QComboBox *modelCameraCombo_ = nullptr;
+	QDoubleSpinBox *modelFovSpin_ = nullptr;
 	std::shared_ptr<cso_gui::StudioModel> currentModel_;
 	// Parallel to currentModel_->Textures(): archive path a texture was
 	// resolved from (empty = still embedded/unresolved). Rebuilt fresh by
@@ -180,7 +185,9 @@ private:
 	QLabel *modelFrameLabel_ = nullptr;
 	QPushButton *modelPlayButton_ = nullptr;
 	QCheckBox *modelWireframeCheck_ = nullptr;
-	QTimer *modelAnimTimer_ = nullptr;
+		QTimer *modelAnimTimer_ = nullptr;
+		QElapsedTimer modelAnimationClock_;
+		float modelAnimationStartFrame_ = 0.0f;
 	QSlider *lightYawSlider_ = nullptr;
 	QSlider *lightPitchSlider_ = nullptr;
 
