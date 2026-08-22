@@ -31,8 +31,25 @@ namespace cso_gui
 
 		// Set the model to display. Clears the view if model is null.
 		void SetModel(std::shared_ptr<StudioModel> model);
+		void SetModel(std::shared_ptr<StudioModel> model, bool firstPerson);
 		void Clear();
 
+		enum class CameraMode
+		{
+			Orbit,
+			FirstPerson
+		};
+
+		void SetCameraMode(CameraMode mode);
+		CameraMode GetCameraMode() const { return cameraMode_; }
+		void SetFirstPersonFieldOfView(float fov);
+		float FirstPersonFieldOfView() const { return firstPersonFov_; }
+
+	signals:
+		void CameraModeChanged(int mode);
+		void FirstPersonFieldOfViewChanged(float fov);
+
+	public:
 		// Rebuilds the GPU textures from the model's current StudioModel::Texture
 		// images on the next paint. Needed after swapping in an externally
 		// resolved texture (SetTextureImage), since BuildGpuMeshes only
@@ -98,8 +115,8 @@ namespace cso_gui
 		void SetSequence(int index);
 		int CurrentSequence() const { return sequenceIndex_; }
 		int CurrentSequenceFrames() const;
-		void SetSequenceFrame(int frame);   // integer frame index (0-based)
-		int CurrentSequenceFrame() const { return sequenceFrame_; }
+		void SetSequenceFrame(float frame); // fractional frame index (0-based)
+		float CurrentSequenceFrame() const { return sequenceFrame_; }
 		void ApplyPose();                    // re-skin + rebuild current pose
 
 		// Compute the model bounds. Returns false when no geometry exists.
@@ -129,6 +146,7 @@ namespace cso_gui
 		void BuildGpuMeshes();
 		void SetupMatrices(int width, int height);
 		void ComputeBounds(bool resetDistance);
+		void LeaveFirstPerson();
 
 		std::shared_ptr<StudioModel> model_;
 
@@ -154,7 +172,7 @@ namespace cso_gui
 		int activeBodyPart_ = 0;      // bodypart whose group is being edited
 		int skinFamily_ = 0;
 		int sequenceIndex_ = -1;      // -1 = rest pose
-		int sequenceFrame_ = 0;
+		float sequenceFrame_ = 0.0f;
 		bool wireframe_ = false;
 		float lightYaw_ = 0.0f;
 		float lightPitch_ = 0.0f;
@@ -163,6 +181,9 @@ namespace cso_gui
 		float pitch_ = 20.0f;
 		float distance_ = 120.0f;
 		float modelScale_ = 1.0f;
+		CameraMode cameraMode_ = CameraMode::Orbit;
+		bool firstPersonModel_ = false;
+		float firstPersonFov_ = 74.0f;
 		QPoint lastMouse_;
 		bool dragging_ = false;
 		bool panning_ = false;
