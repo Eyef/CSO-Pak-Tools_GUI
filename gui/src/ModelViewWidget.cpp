@@ -14,6 +14,11 @@ namespace cso_gui
 {
 	namespace
 	{
+		// Near-plane distance used for the first-person projection in
+		// SetupMatrices, duplicated here so ComputeBounds can skip vertices
+		// that would be clipped anyway when estimating the required FOV.
+		constexpr float kFirstPersonNear = 1.0f;
+
 		constexpr const char *kVertexShader = R"(
 #version 330 core
 in vec3 aPosition;
@@ -82,7 +87,14 @@ void main()
 
 	void ModelViewWidget::SetModel(std::shared_ptr<StudioModel> model)
 	{
+		SetModel(std::move(model), false);
+	}
+
+	void ModelViewWidget::SetModel(std::shared_ptr<StudioModel> model, bool firstPerson)
+	{
 		model_ = std::move(model);
+		firstPersonModel_ = firstPerson;
+		cameraMode_ = firstPerson ? CameraMode::FirstPerson : CameraMode::Orbit;
 		bodyGroup_.clear();
 		activeBodyPart_ = 0;
 		skinFamily_ = 0;
@@ -104,9 +116,84 @@ void main()
 			// does. This renders the complete character instead of one piece.
 			bodyGroup_.resize(model_->BodyParts().size(), 0);
 			ComputeBounds(true);
+
+			if (firstPersonModel_ && !model_->Sequences().empty())
+			{
+				int selected = -1;
+				for (int i = 0; i < static_cast<int>(model_->Sequences().size()); ++i)
+				{
+					const QString label = QString::fromStdString(model_->Sequences()[static_cast<size_t>(i)].label);
+					if (label.compare(QStringLiteral("idle"), Qt::CaseInsensitive) == 0)
+					{
+						selected = i;
+						break;
+					}
+				}
+				if (selected < 0)
+				{
+					for (int i = 0; i < static_cast<int>(model_->Sequences().size()); ++i)
+					{
+						const QString label = QString::fromStdString(model_->Sequences()[static_cast<size_t>(i)].label);
+						if (label.startsWith(QStringLiteral("idle"), Qt::CaseInsensitive)
+							&& label.size() > 4 && label.mid(4).toInt() > 0)
+						{
+							selected = i;
+							break;
+						}
+					}
+				}
+				if (selected < 0)
+				{
+					for (int i = 0; i < static_cast<int>(model_->Sequences().size()); ++i)
+					{
+						if (QString::fromStdString(model_->Sequences()[static_cast<size_t>(i)].label)
+							.startsWith(QStringLiteral("idle"), Qt::CaseInsensitive))
+						{
+							selected = i;
+							break;
+						}
+					}
+				}
+				if (selected < 0)
+					selected = 0;
+				sequenceIndex_ = selected;
+				sequenceFrame_ = 0;
+				model_->ApplyFrame(sequenceIndex_, 0.0f);
+				ComputeBounds(false);
+			}
 		}
 
 		update();
+	}
+
+	void ModelViewWidget::SetCameraMode(CameraMode mode)
+	{
+		if (mode == CameraMode::FirstPerson && !firstPersonModel_)
+			return;
+		if (cameraMode_ == mode)
+			return;
+		cameraMode_ = mode;
+		emit CameraModeChanged(static_cast<int>(cameraMode_));
+		update();
+	}
+
+	void ModelViewWidget::SetFirstPersonFieldOfView(float fov)
+	{
+		firstPersonFov_ = std::clamp(fov, 30.0f, 120.0f);
+		emit FirstPersonFieldOfViewChanged(firstPersonFov_);
+		update();
+	}
+
+	void ModelViewWidget::LeaveFirstPerson()
+	{
+		if (cameraMode_ != CameraMode::FirstPerson)
+			return;
+
+		cameraMode_ = CameraMode::Orbit;
+		yaw_ = -90.0f;
+		pitch_ = 20.0f;
+		ComputeBounds(true);
+		emit CameraModeChanged(static_cast<int>(cameraMode_));
 	}
 
 	void ModelViewWidget::Clear()
@@ -183,6 +270,17 @@ void main()
 
 	void ModelViewWidget::ResetView()
 	{
+		if (cameraMode_ == CameraMode::FirstPerson || firstPersonModel_)
+		{
+			cameraMode_ = CameraMode::FirstPerson;
+			firstPersonFov_ = 74.0f;
+			emit CameraModeChanged(static_cast<int>(cameraMode_));
+			emit FirstPersonFieldOfViewChanged(firstPersonFov_);
+			update();
+			return;
+		}
+
+		cameraMode_ = CameraMode::Orbit;
 		// Same default orbit angle SetModel() starts a fresh model at (see
 		// the comment there about why -90/20, not 0/20).
 		yaw_ = -90.0f;
@@ -288,21 +386,24 @@ void main()
 		if (sequenceIndex_ == index)
 			return;
 		sequenceIndex_ = index;
-		sequenceFrame_ = 0;
+		sequenceFrame_ = 0.0f;
 		// Sequences' blended rest-frame faces +X, so look from the +X side;
 		// the raw rest reference pose faces -Y instead, so orbit back there.
 		yaw_ = (index < 0) ? -90.0f : 0.0f;
 		ApplyPose();
+		// Establish the pivot once for the newly selected sequence. Do not do
+		// this for every frame: root motion and pose bounds would move the camera.
+		ComputeBounds(false);
 	}
 
-	void ModelViewWidget::SetSequenceFrame(int frame)
+	void ModelViewWidget::SetSequenceFrame(float frame)
 	{
 		const int frames = CurrentSequenceFrames();
 		if (frames > 0)
-			frame = frame % frames;
+			frame = std::clamp(frame, 0.0f, static_cast<float>(frames - 1));
 		if (frame < 0)
 			frame = 0;
-		if (sequenceFrame_ == frame)
+		if (std::abs(sequenceFrame_ - frame) < 0.0001f)
 			return;
 		sequenceFrame_ = frame;
 		ApplyPose();
@@ -315,10 +416,6 @@ void main()
 		// Re-skin the model into the requested sequence pose.
 		model_->ApplyFrame(sequenceIndex_,
 			sequenceIndex_ < 0 ? 0.0f : static_cast<float>(sequenceFrame_));
-		// Re-target the orbit camera on the posed geometry so the pivot stays on
-		// the model instead of flying away when animations move the root bone.
-		// Keep the user's zoom; only refresh the aim point and radius.
-		ComputeBounds(false);
 		gpuBuilt_ = false;  // rebuild vertex data next paint
 		update();
 	}
@@ -549,8 +646,38 @@ void main()
 	{
 		const float aspect = height > 0 ? static_cast<float>(width) / height : 1.0f;
 
+		const bool firstPerson = cameraMode_ == CameraMode::FirstPerson;
+		const float baseFov = firstPerson ? firstPersonFov_ : 45.0f;
+
+		// QMatrix4x4::perspective() takes a *vertical* FOV; the horizontal
+		// FOV then falls out of aspect (width/height). If we always fed it
+		// baseFov directly, a tall/narrow first-person viewport (aspect < 1)
+		// would end up with a horizontal FOV *smaller* than baseFov,
+		// clipping the sides of the view-model. To guarantee the configured
+		// FOV is always satisfied horizontally in that case, we solve for
+		// the vertical angle that keeps the *horizontal* angle pinned to
+		// baseFov whenever the first-person viewport is taller than wide.
+		//
+		// This is deliberately based only on the window's aspect ratio, not
+		// on the model's actual geometry: an earlier version tried to widen
+		// the FOV further based on the mesh's real angular extent, but .mdl
+		// view-models can contain secondary particle/glow-effect meshes
+		// positioned far off to the side (not reliably distinguishable from
+		// real geometry), which blew the computed FOV out into a fisheye
+		// view and made the FOV field on the panel stop having any visible
+		// effect. If a specific weapon still doesn't fully fit, widen the
+		// FOV field manually.
+		float verticalFov = baseFov;
+		if (firstPerson && aspect < 1.0f)
+		{
+			const float horizontalHalfRad = qDegreesToRadians(baseFov * 0.5f);
+			const float verticalHalfRad = std::atan(std::tan(horizontalHalfRad) / aspect);
+			verticalFov = qRadiansToDegrees(verticalHalfRad) * 2.0f;
+		}
+
 		QMatrix4x4 projection;
-		projection.perspective(45.0f, aspect, 0.1f, 100000.0f);
+		projection.perspective(verticalFov, aspect,
+			firstPerson ? kFirstPersonNear : 0.1f, firstPerson ? 16777216.0f : 100000.0f);
 
 		const float s = modelScale_;
 		QMatrix4x4 model;
@@ -560,6 +687,28 @@ void main()
 		// the camera instead, with default view direction +X and up +Z, so the
 		// model's front faces the viewer without mirroring.
 		model.scale(s);
+		if (firstPerson)
+			model.translate(0.0f, 0.0f, -1.0f);
+
+		if (firstPerson)
+		{
+			QMatrix4x4 view;
+			view.lookAt(QVector3D(0, 0, 0), QVector3D(1, 0, 0), QVector3D(0, 0, 1));
+			const QMatrix4x4 mvp = projection * view * model;
+			bool invertible = false;
+			const QMatrix4x4 normalFinal = (view * model).inverted(&invertible).transposed();
+			QMatrix4x4 lightRotation;
+			lightRotation.rotate(lightPitch_, 1.0f, 0.0f, 0.0f);
+			lightRotation.rotate(lightYaw_, 0.0f, 1.0f, 0.0f);
+			program_->bind();
+			program_->setUniformValue(mvpLoc_, mvp);
+			program_->setUniformValue(normalMatrixLoc_, normalFinal);
+			program_->setUniformValue(lightDirLoc_, lightRotation.mapVector(QVector3D(0.4f, 0.6f, 1.0f)));
+			program_->setUniformValue(fillLightDirLoc_, lightRotation.mapVector(QVector3D(-0.5f, -0.3f, 0.6f)));
+			program_->setUniformValue(texLoc_, 0);
+			program_->release();
+			return;
+		}
 
 		const QVector3D centerModel(centerX_, centerY_, centerZ_);
 		const QVector3D centerWorld = model.map(centerModel);
@@ -706,6 +855,8 @@ void main()
 
 	void ModelViewWidget::mousePressEvent(QMouseEvent *event)
 	{
+		if (cameraMode_ == CameraMode::FirstPerson)
+			LeaveFirstPerson();
 		if (event->button() == Qt::LeftButton)
 		{
 			lastMouse_ = event->pos();
@@ -779,6 +930,10 @@ void main()
 
 	void ModelViewWidget::wheelEvent(QWheelEvent *event)
 	{
+		if (cameraMode_ == CameraMode::FirstPerson)
+		{
+			LeaveFirstPerson();
+		}
 		const int delta = event->angleDelta().y();
 		distance_ *= (delta > 0) ? 0.9f : 1.1f;
 		// The minimum used to be radius_*0.5 -- fine for a single compact
