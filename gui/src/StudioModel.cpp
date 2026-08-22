@@ -665,6 +665,68 @@ namespace cso_gui
 			float m[16]{};  // column-major
 		};
 
+		struct Quaternion
+		{
+			float w = 1.0f, x = 0.0f, y = 0.0f, z = 0.0f;
+		};
+
+		Quaternion QuaternionFromEuler(const StudioModel::Vec3 &rot)
+		{
+			const float sx = std::sin(rot.x * 0.5f), cx = std::cos(rot.x * 0.5f);
+			const float sy = std::sin(rot.y * 0.5f), cy = std::cos(rot.y * 0.5f);
+			const float sz = std::sin(rot.z * 0.5f), cz = std::cos(rot.z * 0.5f);
+			return { cz * cy * cx + sz * sy * sx,
+				cz * cy * sx - sz * sy * cx,
+				cz * sy * cx + sz * cy * sx,
+				sz * cy * cx - cz * sy * sx };
+		}
+
+		Quaternion Normalize(const Quaternion &q)
+		{
+			const float length = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+			if (length <= std::numeric_limits<float>::epsilon())
+				return {};
+			return { q.w / length, q.x / length, q.y / length, q.z / length };
+		}
+
+		Quaternion Slerp(const Quaternion &from, Quaternion to, float amount)
+		{
+			float dot = from.w * to.w + from.x * to.x + from.y * to.y + from.z * to.z;
+			if (dot < 0.0f)
+			{
+				dot = -dot;
+				to = { -to.w, -to.x, -to.y, -to.z };
+			}
+			if (dot > 0.9995f)
+				return Normalize({ from.w + amount * (to.w - from.w),
+					from.x + amount * (to.x - from.x),
+					from.y + amount * (to.y - from.y),
+					from.z + amount * (to.z - from.z) });
+
+			const float angle = std::acos(std::clamp(dot, -1.0f, 1.0f));
+			const float a = std::sin((1.0f - amount) * angle) / std::sin(angle);
+			const float b = std::sin(amount * angle) / std::sin(angle);
+			return Normalize({ a * from.w + b * to.w, a * from.x + b * to.x,
+				a * from.y + b * to.y, a * from.z + b * to.z });
+		}
+
+		Matrix4 QuaternionMatrix(const Quaternion &q, const StudioModel::Vec3 &pos)
+		{
+			const Quaternion n = Normalize(q);
+			Matrix4 out;
+			out.m[0] = 1 - 2 * (n.y * n.y + n.z * n.z);
+			out.m[1] = 2 * (n.x * n.y + n.w * n.z);
+			out.m[2] = 2 * (n.x * n.z - n.w * n.y);
+			out.m[4] = 2 * (n.x * n.y - n.w * n.z);
+			out.m[5] = 1 - 2 * (n.x * n.x + n.z * n.z);
+			out.m[6] = 2 * (n.y * n.z + n.w * n.x);
+			out.m[8] = 2 * (n.x * n.z + n.w * n.y);
+			out.m[9] = 2 * (n.y * n.z - n.w * n.x);
+			out.m[10] = 1 - 2 * (n.x * n.x + n.y * n.y);
+			out.m[12] = pos.x; out.m[13] = pos.y; out.m[14] = pos.z; out.m[15] = 1;
+			return out;
+		}
+
 		// Build a bone's local matrix from position (translation) + rotation
 		// (euler angles). Layout matches the parser's rest bake in
 		// ParseBodyParts so ApplyFrame(-1) reproduces the loaded default pose.
@@ -887,15 +949,11 @@ namespace cso_gui
 					if (seq.motiontype & 4) pos.z = 0.0f;  // Z
 				}
 
-				// Build the local matrix from the euler angles at this frame.
-				// Interpolate the two surrounding keyframe angles linearly,
-				// then build the same euler rotation matrix the rest pose uses
-				// (LocalBoneMatrix), so animations and rest stay in one
-				// consistent frame.
-				Vec3 rot{fract * rot2.x + (1.0f - fract) * rot1.x,
-					fract * rot2.y + (1.0f - fract) * rot1.y,
-					fract * rot2.z + (1.0f - fract) * rot1.z};
-				localBones[i] = LocalBoneMatrix(pos, rot);
+				// Match HLAM: convert both keyframe Euler rotations to quaternions,
+				// then slerp. Linear Euler interpolation flips limbs when an angle
+				// crosses its wrap boundary.
+				localBones[i] = QuaternionMatrix(Slerp(
+					QuaternionFromEuler(rot1), QuaternionFromEuler(rot2), fract), pos);
 			}
 		}
 		else
