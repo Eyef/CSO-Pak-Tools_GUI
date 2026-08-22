@@ -303,6 +303,48 @@ void MainWindow::BuildUi()
 	modelAnimTimer_ = new QTimer(this);
 	connect(modelAnimTimer_, &QTimer::timeout, this, &MainWindow::OnModelAnimationTick);
 
+	modelCameraBox_ = new QGroupBox(tr("Camera"));
+	auto *cameraLayout = new QVBoxLayout(modelCameraBox_);
+	modelCameraCombo_ = new QComboBox;
+	modelCameraCombo_->addItem(tr("Orbit"));
+	modelCameraCombo_->addItem(tr("First person"));
+	cameraLayout->addWidget(modelCameraCombo_);
+
+	auto *fovRow = new QHBoxLayout;
+	fovRow->addWidget(new QLabel(tr("FOV")));
+	modelFovSpin_ = new QDoubleSpinBox;
+	modelFovSpin_->setRange(30.0, 120.0);
+	modelFovSpin_->setSuffix(QStringLiteral("\u00b0"));
+	modelFovSpin_->setValue(74.0);
+	fovRow->addWidget(modelFovSpin_, 1);
+	cameraLayout->addLayout(fovRow);
+
+	connect(modelCameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+		[this](int index)
+		{
+			modelView_->SetCameraMode(index == 1
+				? cso_gui::ModelViewWidget::CameraMode::FirstPerson
+				: cso_gui::ModelViewWidget::CameraMode::Orbit);
+			modelFovSpin_->setEnabled(index == 1);
+		});
+	connect(modelFovSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+		[this](double value) { modelView_->SetFirstPersonFieldOfView(static_cast<float>(value)); });
+	connect(modelView_, &cso_gui::ModelViewWidget::CameraModeChanged, this,
+		[this](int mode)
+		{
+			modelCameraCombo_->blockSignals(true);
+			modelCameraCombo_->setCurrentIndex(mode == static_cast<int>(cso_gui::ModelViewWidget::CameraMode::FirstPerson) ? 1 : 0);
+			modelCameraCombo_->blockSignals(false);
+			modelFovSpin_->setEnabled(mode == static_cast<int>(cso_gui::ModelViewWidget::CameraMode::FirstPerson));
+		});
+	connect(modelView_, &cso_gui::ModelViewWidget::FirstPersonFieldOfViewChanged, this,
+		[this](float fov)
+		{
+			modelFovSpin_->blockSignals(true);
+			modelFovSpin_->setValue(fov);
+			modelFovSpin_->blockSignals(false);
+		});
+
 	// Reset View is separate from the Lighting box's own Reset (camera vs.
 	// light), also persistent for the same reason. Panning with the fix
 	// above should no longer lose track of the model, but some multi-piece
@@ -342,6 +384,7 @@ void MainWindow::BuildUi()
 	auto *modelRightPanel = new QWidget;
 	auto *modelRightPanelLayout = new QVBoxLayout(modelRightPanel);
 	modelRightPanelLayout->setContentsMargins(0, 0, 0, 0);
+	modelRightPanelLayout->addWidget(modelCameraBox_);
 	modelRightPanelLayout->addWidget(resetViewButton);
 	modelRightPanelLayout->addWidget(lightBox);
 	modelRightPanelLayout->addWidget(modelControlsScroll, 1);
@@ -1080,8 +1123,15 @@ void MainWindow::ShowModel(const cso_pak::PakArchive::Entry &entry, const std::v
 	// model shows real surfaces instead of black.
 	ResolveExternalTextures(model);
 
+	const QString fileName = QFileInfo(QString::fromStdU16String(entry.path)).fileName();
+	const bool firstPerson = fileName.startsWith(QStringLiteral("v_"), Qt::CaseInsensitive);
 	currentModel_ = model;
-	modelView_->SetModel(model);
+	modelView_->SetModel(model, firstPerson);
+	modelCameraCombo_->blockSignals(true);
+	modelCameraCombo_->setCurrentIndex(firstPerson ? 1 : 0);
+	modelCameraCombo_->blockSignals(false);
+	modelFovSpin_->setEnabled(firstPerson);
+	modelCameraBox_->setVisible(firstPerson);
 	RebuildModelControls();
 
 	stack_->setCurrentWidget(modelPageContainer_);
@@ -1506,6 +1556,7 @@ void MainWindow::RebuildModelControls()
 		modelSequenceCombo_->addItem(tr("(rest pose)"));
 		for (int i = 0; i < seqCount; ++i)
 			modelSequenceCombo_->addItem(DecodeModelText(modelView_->SequenceLabel(i)));
+		modelSequenceCombo_->setCurrentIndex(modelView_->CurrentSequence() + 1);
 		connect(modelSequenceCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
 			this, &MainWindow::OnModelSequenceChanged);
 		vLayout->addWidget(modelSequenceCombo_);
@@ -1524,6 +1575,11 @@ void MainWindow::RebuildModelControls()
 		modelFrameLabel_ = new QLabel(tr("Frame 0 / 0"));
 		modelFrameLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 		vLayout->addWidget(modelFrameLabel_);
+
+		// The initial sequence is selected before currentIndexChanged is
+		// connected, so initialize the frame controls explicitly. This matters
+		// for v_ models, whose idle sequence is selected inside SetModel().
+		OnModelSequenceChanged(modelSequenceCombo_->currentIndex());
 	}
 
 	vLayout->addStretch(1);
@@ -1687,7 +1743,9 @@ void MainWindow::OnModelPlayToggled(bool play)
 	if (fps <= 0.0f)
 		fps = 30.0f;
 
-	modelAnimTimer_->start(static_cast<int>(1000.0f / fps));
+	modelAnimationStartFrame_ = modelView_->CurrentSequenceFrame();
+	modelAnimationClock_.restart();
+	modelAnimTimer_->start(16);
 	modelPlayButton_->setText(tr("Pause"));
 }
 
@@ -1696,12 +1754,29 @@ void MainWindow::OnModelAnimationTick()
 	if (modelFrameSlider_ == nullptr)
 		return;
 
-	int next = modelFrameSlider_->value() + 1;
 	const int frames = modelView_->CurrentSequenceFrames();
-	if (frames > 0)
-		next %= frames;
+	if (frames <= 0 || !currentModel_)
+		return;
 
-	modelFrameSlider_->setValue(next); // triggers OnModelFrameSliderMoved via valueChanged
+	const int sequence = modelView_->CurrentSequence();
+	if (sequence < 0 || sequence >= static_cast<int>(currentModel_->Sequences().size()))
+		return;
+
+	const float fps = std::max(currentModel_->Sequences()[static_cast<size_t>(sequence)].fps, 1.0f);
+	// The final Studio frame duplicates the first pose and closes the loop.
+	// Match GoldSource/HLAM by wrapping over NumFrames - 1.
+	const int cycleFrames = std::max(frames - 1, 1);
+	const float elapsedFrame = modelAnimationStartFrame_
+		+ static_cast<float>(modelAnimationClock_.elapsed()) * fps / 1000.0f;
+	const float frame = std::fmod(elapsedFrame, static_cast<float>(cycleFrames));
+	modelView_->SetSequenceFrame(frame);
+
+	const int displayFrame = static_cast<int>(std::floor(frame)) % cycleFrames;
+	modelFrameSlider_->blockSignals(true);
+	modelFrameSlider_->setValue(displayFrame);
+	modelFrameSlider_->blockSignals(false);
+	if (modelFrameLabel_ != nullptr)
+		modelFrameLabel_->setText(tr("Frame %1 / %2").arg(displayFrame).arg(frames));
 }
 
 void MainWindow::ShowSprite(const cso_pak::PakArchive::Entry &entry, const std::vector<uint8_t> &data)
