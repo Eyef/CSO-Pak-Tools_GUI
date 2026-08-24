@@ -65,6 +65,7 @@ private slots:
 	void OnModelPlayToggled(bool play);
 	void OnModelWireframeToggled(bool enabled);
 	void OnModelTextureChanged(int index);
+	void ExportModelTexture();
 	void OnModelForceAdditiveToggled(bool checked);
 	void LoadTexturesFromFolder();
 	void OnLightAnglesChanged();
