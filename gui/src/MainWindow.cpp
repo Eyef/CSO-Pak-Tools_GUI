@@ -22,6 +22,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QResizeEvent>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QSplitter>
 #include <QStatusBar>
@@ -1482,6 +1483,14 @@ void MainWindow::RebuildModelControls()
 		modelTexturePreview_->setFrameShape(QFrame::Box);
 		modelTexturePreview_->setBackgroundRole(QPalette::Dark);
 		modelTexturePreview_->setAutoFillBackground(true);
+		modelTexturePreview_->setContextMenuPolicy(Qt::CustomContextMenu);
+		connect(modelTexturePreview_, &QWidget::customContextMenuRequested, this,
+			[this](const QPoint &position)
+			{
+				QMenu menu(this);
+				menu.addAction(tr("Export texture..."), this, &MainWindow::ExportModelTexture);
+				menu.exec(modelTexturePreview_->mapToGlobal(position));
+			});
 
 		modelTextureInfoLabel_ = new WrappedFitLabel;
 		modelTextureInfoLabel_->setWordWrap(true);
@@ -1667,6 +1676,76 @@ void MainWindow::OnModelTextureChanged(int index)
 		modelForceAdditiveCheck_->setChecked(modelView_->IsTextureAdditive(index));
 		modelForceAdditiveCheck_->blockSignals(false);
 	}
+}
+
+void MainWindow::ExportModelTexture()
+{
+	if (!currentModel_ || modelTextureCombo_ == nullptr)
+		return;
+
+	const int index = modelTextureCombo_->currentIndex();
+	const auto &textures = currentModel_->Textures();
+	if (index < 0 || index >= static_cast<int>(textures.size()))
+		return;
+
+	const auto &texture = textures[static_cast<size_t>(index)];
+	if (texture.image.isNull())
+	{
+		statusBar()->showMessage(tr("The selected texture has no image data."), 5000);
+		return;
+	}
+
+	QString textureName = texture.name.empty()
+		? tr("texture_%1").arg(index)
+		: DecodeModelText(texture.name);
+	// '$' and '#' are meaningful CSO texture-name prefixes (for example
+	// $0a_/$0b_ additive textures and #... external textures), and both are
+	// valid in Windows file names. Preserve them so exported files can still
+	// be matched by their original MDL texture names.
+	textureName.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._#$-]+")), QStringLiteral("_"));
+	if (textureName.isEmpty())
+		textureName = tr("texture_%1").arg(index);
+	if (QFileInfo(textureName).suffix().isEmpty())
+		textureName += QStringLiteral(".bmp");
+
+	QString selectedFilter = tr("Bitmap image (*.bmp)");
+	QString path = QFileDialog::getSaveFileName(this, tr("Export texture"), textureName,
+		tr("Bitmap image (*.bmp);;PNG image (*.png);;JPEG image (*.jpg *.jpeg)"),
+		&selectedFilter);
+	if (path.isEmpty())
+		return;
+
+	QString extension;
+	QByteArray format;
+	if (selectedFilter.startsWith(tr("PNG image")))
+	{
+		extension = QStringLiteral(".png");
+		format = "PNG";
+	}
+	else if (selectedFilter.startsWith(tr("JPEG image")))
+	{
+		extension = QStringLiteral(".jpg");
+		format = "JPG";
+	}
+	else
+	{
+		extension = QStringLiteral(".bmp");
+		format = "BMP";
+	}
+
+	// QFileDialog can leave the original extension in the returned path when
+	// the user changes the selected filter. Replace it explicitly so the file
+	// name and the actual image codec always agree.
+	const QFileInfo selectedPath(path);
+	path = QDir(selectedPath.path()).filePath(selectedPath.completeBaseName() + extension);
+	if (!texture.image.save(path, format.constData()))
+	{
+		QMessageBox::warning(this, tr("Export texture"),
+			tr("Failed to save the texture to:\n%1").arg(path));
+		return;
+	}
+
+	statusBar()->showMessage(tr("Texture saved to %1").arg(path), 5000);
 }
 
 void MainWindow::OnModelForceAdditiveToggled(bool checked)
