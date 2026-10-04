@@ -20,15 +20,27 @@ PakTreeModel::PakTreeModel(QObject *parent)
 
 void PakTreeModel::SetArchive(const cso_pak::PakArchive *archive)
 {
+	if (archive != nullptr)
+		SetArchives({ archive });
+	else
+		SetArchives({});
+}
+
+void PakTreeModel::SetArchives(const std::vector<const cso_pak::PakArchive*> &archives)
+{
 	beginResetModel();
 
-	archive_ = archive;
+	archives_ = archives;
 	root_ = std::make_unique<Node>();
 	wadArchives_.clear();
 
-	if (archive_ != nullptr)
+	for (int pakIndex = 0; pakIndex < static_cast<int>(archives_.size()); ++pakIndex)
 	{
-		const auto &entries = archive_->Entries();
+		const auto *archive = archives_[static_cast<size_t>(pakIndex)];
+		if (archive == nullptr)
+			continue;
+
+		const auto &entries = archive->Entries();
 		for (int i = 0; i < static_cast<int>(entries.size()); ++i)
 		{
 			const auto &entry = entries[static_cast<size_t>(i)];
@@ -45,22 +57,23 @@ void PakTreeModel::SetArchive(const cso_pak::PakArchive *archive)
 			fileNode->name = parts.last();
 			fileNode->parent = current;
 			fileNode->kind = NodeKind::PakFile;
+			fileNode->pakIndex = pakIndex;
 			fileNode->entryIndex = i;
 			Node *fileNodeRaw = fileNode.get();
 			current->children.push_back(std::move(fileNode));
 
-			AddWadChildrenIfApplicable(fileNodeRaw, i);
+			AddWadChildrenIfApplicable(fileNodeRaw, archive, i);
 		}
-
-		SortChildrenRecursive(root_.get());
 	}
+
+	SortChildrenRecursive(root_.get());
 
 	endResetModel();
 }
 
-void PakTreeModel::AddWadChildrenIfApplicable(Node *fileNode, int entryIndex)
+void PakTreeModel::AddWadChildrenIfApplicable(Node *fileNode, const cso_pak::PakArchive *archive, int entryIndex)
 {
-	if (archive_ == nullptr)
+	if (archive == nullptr)
 		return;
 
 	const QString extension = QFileInfo(fileNode->name).suffix().toLower();
@@ -73,8 +86,8 @@ void PakTreeModel::AddWadChildrenIfApplicable(Node *fileNode, int entryIndex)
 	// format in this app.
 	try
 	{
-		const auto &entry = archive_->Entries()[static_cast<size_t>(entryIndex)];
-		auto data = archive_->ExtractEntry(entry);
+		const auto &entry = archive->Entries()[static_cast<size_t>(entryIndex)];
+		auto data = archive->ExtractEntry(entry);
 		auto wad = std::make_unique<cso_gui::Wad3Archive>(cso_gui::Wad3Archive::Load(std::move(data)));
 
 		const int wadArchiveIndex = static_cast<int>(wadArchives_.size());
@@ -90,6 +103,7 @@ void PakTreeModel::AddWadChildrenIfApplicable(Node *fileNode, int entryIndex)
 				: QString::fromStdString(lump.name);
 			lumpNode->parent = fileNode;
 			lumpNode->kind = NodeKind::WadLump;
+			lumpNode->pakIndex = fileNode->pakIndex;
 			lumpNode->wadArchiveIndex = wadArchiveIndex;
 			lumpNode->wadEntryIndex = i;
 			fileNode->children.push_back(std::move(lumpNode));
@@ -129,12 +143,18 @@ void PakTreeModel::SortChildrenRecursive(Node *node)
 	// begin with (a .wad node's children are ALL WadLump).
 	if (node->children.empty() || node->children.front()->kind != NodeKind::WadLump)
 	{
-		std::ranges::sort(node->children, [](const auto &left, const auto &right)
+		std::ranges::sort(node->children, [this](const auto &left, const auto &right)
 		{
 			if (left->IsFolder() != right->IsFolder())
 				return left->IsFolder(); // Folders before files, like Explorer.
 
-			return QString::compare(left->name, right->name, Qt::CaseInsensitive) < 0;
+			const int nameOrder = QString::compare(left->name, right->name, Qt::CaseInsensitive);
+			if (nameOrder != 0)
+				return nameOrder < 0;
+
+			// Same virtual name from several archives: keep a stable order
+			// by source pak so duplicates don't shuffle between reloads.
+			return left->pakIndex < right->pakIndex;
 		});
 	}
 
@@ -160,6 +180,24 @@ int PakTreeModel::EntryIndexForIndex(const QModelIndex &index) const
 		return -1;
 
 	return node->entryIndex;
+}
+
+int PakTreeModel::PakIndexForIndex(const QModelIndex &index) const
+{
+	const Node *node = NodeFromIndex(index);
+	if (node == nullptr || node == root_.get() || node->IsFolder())
+		return -1;
+
+	return node->pakIndex;
+}
+
+const cso_pak::PakArchive *PakTreeModel::ArchiveForIndex(const QModelIndex &index) const
+{
+	const int pakIndex = PakIndexForIndex(index);
+	if (pakIndex < 0 || pakIndex >= static_cast<int>(archives_.size()))
+		return nullptr;
+
+	return archives_[static_cast<size_t>(pakIndex)];
 }
 
 bool PakTreeModel::IsFolder(const QModelIndex &index) const
@@ -200,27 +238,27 @@ const cso_gui::Wad3Archive *PakTreeModel::WadArchiveAt(int wadArchiveIndex) cons
 	return wadArchives_[static_cast<size_t>(wadArchiveIndex)].get();
 }
 
-void PakTreeModel::CollectEntryIndicesRecursive(const Node *node, std::vector<int> &out)
+void PakTreeModel::CollectResolvedRefsRecursive(const Node *node, std::vector<ResolvedRef> &out)
 {
 	if (node->kind == NodeKind::WadLump)
 		return; // Not a real top-level pak entry; nothing to extract it as.
 
 	if (node->kind == NodeKind::PakFile)
 	{
-		out.push_back(node->entryIndex);
+		out.push_back({ node->pakIndex, node->entryIndex });
 		return;
 	}
 
 	for (const auto &child : node->children)
-		CollectEntryIndicesRecursive(child.get(), out);
+		CollectResolvedRefsRecursive(child.get(), out);
 }
 
-std::vector<int> PakTreeModel::CollectEntryIndices(const QModelIndex &index) const
+std::vector<PakTreeModel::ResolvedRef> PakTreeModel::CollectResolvedRefs(const QModelIndex &index) const
 {
-	std::vector<int> result;
+	std::vector<ResolvedRef> result;
 	const Node *node = NodeFromIndex(index);
 	if (node != nullptr)
-		CollectEntryIndicesRecursive(node, result);
+		CollectResolvedRefsRecursive(node, result);
 
 	return result;
 }
@@ -267,7 +305,19 @@ int PakTreeModel::rowCount(const QModelIndex &parent) const
 
 int PakTreeModel::columnCount(const QModelIndex & /*parent*/) const
 {
-	return 1;
+	return 1; // Name only; the source pak is shown via tooltip and status bar.
+}
+
+QString PakTreeModel::SourceNameForPak(int pakIndex) const
+{
+	if (pakIndex < 0 || pakIndex >= static_cast<int>(archives_.size()))
+		return QString();
+
+	const auto *archive = archives_[static_cast<size_t>(pakIndex)];
+	if (archive == nullptr)
+		return QString();
+
+	return QString::fromStdU16String(archive->SourceFileName());
 }
 
 QVariant PakTreeModel::data(const QModelIndex &index, int role) const
@@ -281,6 +331,14 @@ QVariant PakTreeModel::data(const QModelIndex &index, int role) const
 
 	if (role == Qt::DisplayRole)
 		return node->name;
+
+	if (role == Qt::ToolTipRole && !node->IsFolder())
+	{
+		const QString source = SourceNameForPak(node->pakIndex);
+		if (source.isEmpty())
+			return node->name;
+		return tr("%1\nSource: %2").arg(node->name, source);
+	}
 
 	if (role == Qt::DecorationRole)
 	{
