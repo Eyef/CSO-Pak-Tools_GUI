@@ -8,6 +8,7 @@
 
 #include <QAbstractTextDocumentLayout>
 #include <QAction>
+#include <QApplication>
 #include <QByteArrayView>
 #include <QDir>
 #include <QDirIterator>
@@ -21,6 +22,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QProgressDialog>
 #include <QResizeEvent>
 #include <QRegularExpression>
 #include <QSettings>
@@ -41,6 +43,27 @@
 
 namespace
 {
+	// CSO marks "load this from outside the .mdl" textures with a leading '#'
+	// (e.g. "#256256hand_p.bmp"), but the file itself is stored without it.
+	// Strip the marker before comparing names, on both sides, so pak entries
+	// and folder files match regardless of which form they use.
+	std::string StripTextureNamePrefix(std::string name)
+	{
+		while (!name.empty() && name.front() == '#')
+			name.erase(name.begin());
+		return name;
+	}
+
+	// Optional "textures" folder shipped next to the executable (e.g. with
+	// hand textures extracted from elsewhere). Used automatically as a last
+	// fallback, so bundled textures work out of the box with no setup.
+	QString BundledTextureFolder()
+	{
+		const QString dir =
+			QCoreApplication::applicationDirPath() + QStringLiteral("/textures");
+		return QDir(dir).exists() ? dir : QString();
+	}
+
 	// Preview pages, in the order they are added to the QStackedWidget.
 	enum PreviewPage
 	{
@@ -166,6 +189,12 @@ MainWindow::MainWindow(QWidget *parent)
 {
 	BuildUi();
 	BuildMenusAndToolbar();
+
+	// Restore the remembered texture folder, if it still exists.
+	const QSettings settings;
+	const QString savedFolder = settings.value(QStringLiteral("textureFolder")).toString();
+	if (!savedFolder.isEmpty() && QDir(savedFolder).exists())
+		textureFolder_ = savedFolder;
 
 	setWindowTitle(tr("CS Online Pak Browser"));
 	resize(1200, 800);
@@ -462,6 +491,9 @@ void MainWindow::BuildMenusAndToolbar()
 	auto *openAction = fileMenu->addAction(tr("&Open Pak..."), this, &MainWindow::OnOpenPak);
 	openAction->setShortcut(QKeySequence::Open);
 
+	fileMenu->addAction(tr("Open &Multiple Paks..."), this, &MainWindow::OnOpenPaks);
+	fileMenu->addAction(tr("Open Pak &Folder..."), this, &MainWindow::OnOpenPakFolder);
+
 	recentFilesMenu_ = fileMenu->addMenu(tr("Recent &Files"));
 	UpdateRecentFilesMenu();
 
@@ -509,32 +541,153 @@ void MainWindow::OnOpenPak()
 	LoadPak(path);
 }
 
+void MainWindow::OnOpenPaks()
+{
+	const QStringList paths = QFileDialog::getOpenFileNames(this, tr("Open Pak Archives"),
+		QString(), tr("Pak Archives (*.pak);;All Files (*)"));
+	if (paths.isEmpty())
+		return;
+
+	LoadPaks(paths);
+}
+
+void MainWindow::OnOpenPakFolder()
+{
+	const QString dir = QFileDialog::getExistingDirectory(this,
+		tr("Open Folder Containing Pak Archives"));
+	if (dir.isEmpty())
+		return;
+
+	QDir pakDir(dir);
+	const QStringList names = pakDir.entryList(QStringList() << QStringLiteral("*.pak"),
+		QDir::Files | QDir::Readable, QDir::Name | QDir::LocaleAware);
+	if (names.isEmpty())
+	{
+		QMessageBox::information(this, tr("No Pak Archives"),
+			tr("No .pak files were found in:\n%1").arg(dir));
+		return;
+	}
+
+	QStringList paths;
+	paths.reserve(names.size());
+	for (const QString &name : names)
+		paths << pakDir.absoluteFilePath(name);
+
+	LoadPaks(paths);
+}
+
 void MainWindow::LoadPak(const QString &path)
 {
-	try
+	LoadPaks({ path });
+	AddRecentFile(QFileInfo(path).absoluteFilePath());
+}
+
+void MainWindow::LoadPaks(const QStringList &paths)
+{
+	if (paths.isEmpty())
+		return;
+
+	// Indexing hundreds of paks means gigabytes of sequential disk reads,
+	// so show progress and allow cancelling partway through.
+	QProgressDialog progress(tr("Loading Pak archives..."), tr("Cancel"), 0,
+		paths.size(), this);
+	progress.setWindowModality(Qt::WindowModal);
+	progress.setMinimumDuration(400);
+
+	std::vector<std::unique_ptr<cso_pak::PakArchive>> loaded;
+	loaded.reserve(static_cast<size_t>(paths.size()));
+	QStringList failed;
+
+	for (int i = 0; i < paths.size(); ++i)
 	{
-		const std::filesystem::path fsPath(path.toStdU16String());
-		auto archive = std::make_unique<cso_pak::PakArchive>(cso_pak::PakArchive::Load(fsPath));
-		archive_ = std::move(archive);
-		model_->SetArchive(archive_.get());
-		treeView_->expandToDepth(0);
+		progress.setValue(i);
+		progress.setLabelText(tr("Loading %1 (%2 of %3)...")
+			.arg(QFileInfo(paths[i]).fileName()).arg(i + 1).arg(paths.size()));
+		QApplication::processEvents();
+		if (progress.wasCanceled())
+			break;
 
-		extractAllAction_->setEnabled(true);
-		extractSelectedAction_->setEnabled(true);
-		extractSelectedDecodedAction_->setEnabled(true);
-
-		ShowPlaceholder(tr("Select a file in the tree to preview it."));
-		setWindowTitle(tr("%1 \u2014 CS Online Pak Browser").arg(QFileInfo(path).fileName()));
-		statusBar()->showMessage(tr("Loaded %1 (%2 entries)")
-			.arg(QFileInfo(path).fileName())
-			.arg(archive_->Entries().size()));
-
-		AddRecentFile(QFileInfo(path).absoluteFilePath());
+		try
+		{
+			loaded.push_back(std::make_unique<cso_pak::PakArchive>(
+				cso_pak::PakArchive::Load(
+					std::filesystem::path(paths[static_cast<int>(i)].toStdU16String()))));
+		}
+		catch (const std::exception &ex)
+		{
+			failed << tr("%1: %2").arg(QFileInfo(paths[i]).fileName(),
+				QString::fromUtf8(ex.what()));
+		}
 	}
-	catch (const std::exception &ex)
+	progress.setValue(paths.size());
+
+	if (loaded.empty())
 	{
-		QMessageBox::critical(this, tr("Failed to open archive"), QString::fromUtf8(ex.what()));
+		QMessageBox::critical(this, tr("Failed to open archives"),
+			failed.isEmpty()
+				? tr("No archives were loaded.")
+				: tr("None of the selected archives could be loaded:\n%1").arg(failed.join(QLatin1Char('\n'))));
+		return;
 	}
+
+	archives_ = std::move(loaded);
+	currentModelPakIndex_ = -1;
+
+	std::vector<const cso_pak::PakArchive*> views;
+	views.reserve(archives_.size());
+	for (const auto &archive : archives_)
+		views.push_back(archive.get());
+	model_->SetArchives(views);
+	treeView_->expandToDepth(0);
+
+	extractAllAction_->setEnabled(true);
+	extractSelectedAction_->setEnabled(true);
+	extractSelectedDecodedAction_->setEnabled(true);
+
+	ShowPlaceholder(tr("Select a file in the tree to preview it."));
+
+	const size_t totalEntries = TotalEntryCount();
+	if (archives_.size() == 1)
+	{
+		const QString name = QFileInfo(QString::fromStdU16String(archives_.front()->SourcePath().generic_u16string())).fileName();
+		setWindowTitle(tr("%1 \u2014 CS Online Pak Browser").arg(name));
+		statusBar()->showMessage(tr("Loaded %1 (%2 entries)").arg(name).arg(totalEntries));
+	}
+	else
+	{
+		setWindowTitle(tr("%1 paks \u2014 CS Online Pak Browser").arg(archives_.size()));
+		statusBar()->showMessage(tr("Loaded %1 paks (%2 entries total)").arg(archives_.size()).arg(totalEntries));
+	}
+
+	if (!failed.isEmpty())
+		QMessageBox::warning(this, tr("Some archives failed to load"), failed.join(QLatin1Char('\n')));
+}
+
+size_t MainWindow::TotalEntryCount() const
+{
+	size_t total = 0;
+	for (const auto &archive : archives_)
+		total += archive->Entries().size();
+	return total;
+}
+
+MainWindow::ArchiveEntryRef MainWindow::ResolveIndex(const QModelIndex &index) const
+{
+	ArchiveEntryRef ref;
+	const int pakIndex = model_->PakIndexForIndex(index);
+	const int entryIndex = model_->EntryIndexForIndex(index);
+	if (pakIndex < 0 || entryIndex < 0 ||
+		pakIndex >= static_cast<int>(archives_.size()))
+		return ref;
+
+	ref.archive = archives_[static_cast<size_t>(pakIndex)].get();
+	if (entryIndex >= static_cast<int>(ref.archive->Entries().size()))
+	{
+		ref.archive = nullptr;
+		return ref;
+	}
+	ref.entry = &ref.archive->Entries()[static_cast<size_t>(entryIndex)];
+	return ref;
 }
 
 void MainWindow::AddRecentFile(const QString &path)
@@ -601,48 +754,46 @@ void MainWindow::UpdateRecentFilesMenu()
 
 void MainWindow::OnExtractAll()
 {
-	if (!archive_)
+	if (!HasArchives())
 		return;
 
 	const QString dir = QFileDialog::getExistingDirectory(this, tr("Choose output folder"));
 	if (dir.isEmpty())
 		return;
 
-	try
-	{
-		const auto stats = archive_->UnpackToDirectory(std::filesystem::path(dir.toStdU16String()));
-		QMessageBox::information(this, tr("Extraction complete"),
-			tr("Extracted %1 of %2 entries.").arg(stats.writtenEntries).arg(stats.totalEntries));
-	}
-	catch (const std::exception &ex)
-	{
-		QMessageBox::critical(this, tr("Extraction failed"), QString::fromUtf8(ex.what()));
-	}
+	// Extract the whole merged tree. Duplicate virtual paths from several
+	// archives are disambiguated with a pak suffix instead of silently
+	// overwriting each other.
+	ExtractIndicesToDirectory(model_->CollectResolvedRefs(QModelIndex()), dir);
 }
 
-std::vector<int> MainWindow::CollectSelectedEntryIndices() const
+std::vector<PakTreeModel::ResolvedRef> MainWindow::CollectSelectedRefs() const
 {
-	std::set<int> uniqueIndices;
+	std::set<std::pair<int, int>> uniqueRefs;
 	const auto selected = treeView_->selectionModel()->selectedIndexes();
 	for (const auto &index : selected)
 	{
 		if (index.column() != 0)
 			continue;
 
-		for (const int entryIndex : model_->CollectEntryIndices(index))
-			uniqueIndices.insert(entryIndex);
+		for (const auto &ref : model_->CollectResolvedRefs(index))
+			uniqueRefs.emplace(ref.pakIndex, ref.entryIndex);
 	}
 
-	return { uniqueIndices.begin(), uniqueIndices.end() };
+	std::vector<PakTreeModel::ResolvedRef> result;
+	result.reserve(uniqueRefs.size());
+	for (const auto &[pakIndex, entryIndex] : uniqueRefs)
+		result.push_back({ pakIndex, entryIndex });
+	return result;
 }
 
 void MainWindow::OnExtractSelected()
 {
-	if (!archive_)
+	if (!HasArchives())
 		return;
 
-	const auto indices = CollectSelectedEntryIndices();
-	if (indices.empty())
+	const auto refs = CollectSelectedRefs();
+	if (refs.empty())
 	{
 		QMessageBox::information(this, tr("Nothing selected"),
 			tr("Select one or more files or folders in the tree first."));
@@ -653,16 +804,16 @@ void MainWindow::OnExtractSelected()
 	if (dir.isEmpty())
 		return;
 
-	ExtractIndicesToDirectory(indices, dir);
+	ExtractIndicesToDirectory(refs, dir);
 }
 
 void MainWindow::OnExtractSelectedDecoded()
 {
-	if (!archive_)
+	if (!HasArchives())
 		return;
 
-	const auto indices = CollectSelectedEntryIndices();
-	if (indices.empty())
+	const auto refs = CollectSelectedRefs();
+	if (refs.empty())
 	{
 		QMessageBox::information(this, tr("Nothing selected"),
 			tr("Select one or more files or folders in the tree first."));
@@ -673,17 +824,27 @@ void MainWindow::OnExtractSelectedDecoded()
 	if (dir.isEmpty())
 		return;
 
-	ExtractIndicesToDirectory(indices, dir, /*decodeCso=*/true);
+	ExtractIndicesToDirectory(refs, dir, /*decodeCso=*/true);
 }
 
-void MainWindow::ExtractIndicesToDirectory(const std::vector<int> &entryIndices, const QString &destRoot, bool decodeCso)
+void MainWindow::ExtractIndicesToDirectory(const std::vector<PakTreeModel::ResolvedRef> &refs,
+	const QString &destRoot, bool decodeCso)
 {
 	int succeeded = 0;
 	QStringList errors;
+	// Tracks destination paths already written during this run so duplicate
+	// virtual paths from different archives don't silently overwrite.
+	std::set<QString> usedPaths;
 
-	for (const int index : entryIndices)
+	for (const auto &ref : refs)
 	{
-		const auto &entry = archive_->Entries()[static_cast<size_t>(index)];
+		if (ref.pakIndex < 0 || ref.pakIndex >= static_cast<int>(archives_.size()))
+			continue;
+		const auto *archive = archives_[static_cast<size_t>(ref.pakIndex)].get();
+		if (ref.entryIndex < 0 || ref.entryIndex >= static_cast<int>(archive->Entries().size()))
+			continue;
+
+		const auto &entry = archive->Entries()[static_cast<size_t>(ref.entryIndex)];
 		QString relative = SanitizedRelativePath(entry.path);
 		if (relative.isEmpty())
 		{
@@ -693,7 +854,7 @@ void MainWindow::ExtractIndicesToDirectory(const std::vector<int> &entryIndices,
 
 		try
 		{
-			auto data = archive_->ExtractEntry(entry);
+			auto data = archive->ExtractEntry(entry);
 
 			const bool isCso = relative.endsWith(QLatin1String(".cso"), Qt::CaseInsensitive);
 			if (decodeCso && isCso)
@@ -714,7 +875,26 @@ void MainWindow::ExtractIndicesToDirectory(const std::vector<int> &entryIndices,
 				relative += QStringLiteral(".csv");
 			}
 
-			const QString destPath = QDir(destRoot).filePath(relative);
+			// Several archives can contain the same virtual path. Keep every
+			// variant: the first keeps its plain name, later ones get a pak
+			// suffix so nothing is lost to overwriting.
+			QString destRelative = relative;
+			if (!usedPaths.insert(destRelative).second)
+			{
+				const QFileInfo clash(destRelative);
+				const QString pakBase = QFileInfo(
+					QString::fromStdU16String(archive->SourcePath().generic_u16string())).completeBaseName();
+				destRelative = clash.path() + QLatin1Char('/') + clash.completeBaseName()
+					+ QStringLiteral("__from_") + pakBase;
+				if (!clash.suffix().isEmpty())
+					destRelative += QLatin1Char('.') + clash.suffix();
+				int counter = 2;
+				while (!usedPaths.insert(destRelative).second)
+					destRelative = clash.path() + QLatin1Char('/') + clash.completeBaseName()
+						+ QStringLiteral("__from_") + pakBase + QString::number(counter++);
+			}
+
+			const QString destPath = QDir(destRoot).filePath(destRelative);
 			const QFileInfo info(destPath);
 			QDir().mkpath(info.absolutePath());
 
@@ -731,7 +911,7 @@ void MainWindow::ExtractIndicesToDirectory(const std::vector<int> &entryIndices,
 		}
 	}
 
-	QString summary = tr("Extracted %1 of %2 file(s).").arg(succeeded).arg(entryIndices.size());
+	QString summary = tr("Extracted %1 of %2 file(s).").arg(succeeded).arg(refs.size());
 	if (!errors.isEmpty())
 		summary += QStringLiteral("\n\n") + tr("Errors:") + QStringLiteral("\n") + errors.join(QStringLiteral("\n"));
 
@@ -818,7 +998,7 @@ void MainWindow::OnPatchArchive()
 
 void MainWindow::OnCurrentChanged(const QModelIndex &current, const QModelIndex & /*previous*/)
 {
-	if (!archive_ || !current.isValid())
+	if (!HasArchives() || !current.isValid())
 	{
 		ShowPlaceholder(tr("Select a file in the tree to preview it."));
 		return;
@@ -836,29 +1016,35 @@ void MainWindow::OnCurrentChanged(const QModelIndex &current, const QModelIndex 
 		return;
 	}
 
-	const int entryIndex = model_->EntryIndexForIndex(current);
-	if (entryIndex < 0)
+	const ArchiveEntryRef ref = ResolveIndex(current);
+	if (ref.entry == nullptr)
 	{
 		ShowPlaceholder(tr("Select a file in the tree to preview it."));
 		return;
 	}
 
-	ShowPreviewForEntry(archive_->Entries()[static_cast<size_t>(entryIndex)]);
+	// With several archives open the same virtual path can exist in many
+	// of them -- always show which concrete file is being previewed.
+	statusBar()->showMessage(tr("%1  —  %2")
+		.arg(QString::fromStdU16String(ref.entry->path),
+			QString::fromStdU16String(ref.archive->SourceFileName())));
+	ShowPreviewForEntry(ref.archive, *ref.entry);
 }
 
 void MainWindow::OnTreeDoubleClicked(const QModelIndex &index)
 {
-	if (!archive_ || model_->IsFolder(index))
+	if (!HasArchives() || model_->IsFolder(index))
 		return;
 
-	const int entryIndex = model_->EntryIndexForIndex(index);
-	if (entryIndex < 0)
+	const ArchiveEntryRef ref = ResolveIndex(index);
+	if (ref.entry == nullptr)
 		return;
 
-	ExtractOneWithDialog(archive_->Entries()[static_cast<size_t>(entryIndex)]);
+	ExtractOneWithDialog(ref.archive, *ref.entry);
 }
 
-void MainWindow::ExtractOneWithDialog(const cso_pak::PakArchive::Entry &entry)
+void MainWindow::ExtractOneWithDialog(const cso_pak::PakArchive *archive,
+	const cso_pak::PakArchive::Entry &entry)
 {
 	const QString suggestedName = QFileInfo(QString::fromStdU16String(entry.path)).fileName();
 	const QString dest = QFileDialog::getSaveFileName(this, tr("Save extracted file"), suggestedName);
@@ -867,7 +1053,7 @@ void MainWindow::ExtractOneWithDialog(const cso_pak::PakArchive::Entry &entry)
 
 	try
 	{
-		const auto data = archive_->ExtractEntry(entry);
+		const auto data = archive->ExtractEntry(entry);
 		QFile file(dest);
 		if (!file.open(QIODevice::WriteOnly))
 			throw std::runtime_error("failed to open output file");
@@ -883,7 +1069,7 @@ void MainWindow::ExtractOneWithDialog(const cso_pak::PakArchive::Entry &entry)
 
 void MainWindow::OnTreeContextMenu(const QPoint &pos)
 {
-	if (!archive_)
+	if (!HasArchives())
 		return;
 
 	QMenu menu(this);
@@ -1123,6 +1309,9 @@ void MainWindow::ShowModel(const cso_pak::PakArchive::Entry &entry, const std::v
 	// same pak. Bind them before the 3D view builds its GPU textures, so the
 	// model shows real surfaces instead of black.
 	ResolveExternalTextures(model);
+	// Whatever the archives couldn't provide, try the remembered texture
+	// folder (if any) so it doesn't have to be re-picked for every model.
+	ApplyRememberedTextureFolder(model);
 
 	const QString fileName = QFileInfo(QString::fromStdU16String(entry.path)).fileName();
 	const bool firstPerson = fileName.startsWith(QStringLiteral("v_"), Qt::CaseInsensitive);
@@ -1188,21 +1377,25 @@ QImage MainWindow::DecodeImageFile(const QString &path)
 bool MainWindow::FileMatchesTextureName(const QString &path, const std::string &textureName)
 {
 	const QFileInfo info(path);
-	const QString wanted = QString::fromLatin1(textureName.c_str());
-	if (info.fileName().compare(wanted, Qt::CaseInsensitive) == 0)
+	QString fileName = info.fileName();
+	while (fileName.startsWith(QLatin1Char('#')))
+		fileName.remove(0, 1);
+	const QString wanted = QString::fromLatin1(StripTextureNamePrefix(textureName).c_str());
+	if (fileName.compare(wanted, Qt::CaseInsensitive) == 0)
 		return true;
 
 	// Some packs ship the same texture under another extension (the .mdl asks
 	// for "foo.bmp" but the folder contains "foo.tga"); compare base names.
-	return info.completeBaseName().compare(
+	return QFileInfo(fileName).completeBaseName().compare(
 		QFileInfo(wanted).completeBaseName(), Qt::CaseInsensitive) == 0;
 }
 
-const cso_pak::PakArchive::Entry *MainWindow::FindArchiveEntryForTextureName(
+MainWindow::ArchiveEntryRef MainWindow::FindArchiveEntryForTextureName(
 	const std::string &textureName) const
 {
-	if (!archive_)
-		return nullptr;
+	ArchiveEntryRef none;
+	if (!HasArchives())
+		return none;
 
 	// Fold to lowercase ASCII so the byte-level match is case-insensitive
 	// without depending on Qt's encoding assumptions for model name bytes.
@@ -1215,14 +1408,48 @@ const cso_pak::PakArchive::Entry *MainWindow::FindArchiveEntryForTextureName(
 
 	auto entryFileName = [](const std::u16string &path) -> std::string
 		{
-			return QFileInfo(QString::fromStdU16String(path)).fileName().toUtf8().toStdString();
+			const std::string raw =
+				QFileInfo(QString::fromStdU16String(path)).fileName().toUtf8().toStdString();
+			return StripTextureNamePrefix(raw);
 		};
 
-	const std::string wanted = fold(textureName);
-	for (const auto &entry : archive_->Entries())
+	const std::string wanted = fold(StripTextureNamePrefix(textureName));
+
+	// Search order: the model's own archive first (a same-named texture in
+	// the same pak is the most likely intended one), then all other loaded
+	// archives. This is what makes models work when their textures were
+	// split into a neighbouring pak by the game update layout.
+	std::vector<int> searchOrder;
+	searchOrder.reserve(archives_.size());
+	if (currentModelPakIndex_ >= 0 && currentModelPakIndex_ < static_cast<int>(archives_.size()))
+		searchOrder.push_back(currentModelPakIndex_);
+	for (int i = 0; i < static_cast<int>(archives_.size()); ++i)
 	{
-		if (fold(entryFileName(entry.path)) == wanted)
-			return &entry;  // exact filename match wins
+		if (i != currentModelPakIndex_)
+			searchOrder.push_back(i);
+	}
+
+	auto findIn = [&](int pakIndex) -> ArchiveEntryRef
+		{
+			ArchiveEntryRef ref;
+			const auto *archive = archives_[static_cast<size_t>(pakIndex)].get();
+			for (const auto &entry : archive->Entries())
+			{
+				if (fold(entryFileName(entry.path)) == wanted)
+				{
+					ref.archive = archive;
+					ref.entry = &entry;
+					return ref;
+				}
+			}
+		return ref;
+	};
+
+	for (const int pakIndex : searchOrder)
+	{
+		const ArchiveEntryRef ref = findIn(pakIndex);
+		if (ref.entry != nullptr)
+			return ref;  // exact filename match wins
 	}
 
 	// No exact file: retry with the same base name but any image extension,
@@ -1235,25 +1462,29 @@ const cso_pak::PakArchive::Entry *MainWindow::FindArchiveEntryForTextureName(
 	static const char *const kAltExtensions[] = { "tga", "dds", "bmp", "png", "jpg", "jpeg" };
 	for (const char *altExtension : kAltExtensions)
 	{
-		for (const auto &entry : archive_->Entries())
+		for (const int pakIndex : searchOrder)
 		{
-			const std::string name = fold(entryFileName(entry.path));
-			const size_t entryDot = name.find_last_of('.');
-			if (entryDot == std::string::npos)
-				continue;
-			if (name.compare(0, entryDot, wantedBase) == 0 &&
-				name.compare(entryDot + 1, std::string::npos, altExtension) == 0)
-				return &entry;
+			const auto *archive = archives_[static_cast<size_t>(pakIndex)].get();
+			for (const auto &entry : archive->Entries())
+			{
+				const std::string name = fold(entryFileName(entry.path));
+				const size_t entryDot = name.find_last_of('.');
+				if (entryDot == std::string::npos)
+					continue;
+				if (name.compare(0, entryDot, wantedBase) == 0 &&
+					name.compare(entryDot + 1, std::string::npos, altExtension) == 0)
+					return { archive, &entry };
+			}
 		}
 	}
 
-	return nullptr;
+	return none;
 }
 
 void MainWindow::ResolveExternalTextures(const std::shared_ptr<cso_gui::StudioModel> &model)
 {
 	externalTextureSources_.clear();
-	if (!model || !archive_)
+	if (!model || !HasArchives())
 		return;
 
 	const auto &textures = model->Textures();
@@ -1265,27 +1496,30 @@ void MainWindow::ResolveExternalTextures(const std::shared_ptr<cso_gui::StudioMo
 		if (!TextureLooksExternal(tex))
 			continue;
 
-		const cso_pak::PakArchive::Entry *found =
-			FindArchiveEntryForTextureName(tex.name);
-		if (!found)
+		const ArchiveEntryRef found = FindArchiveEntryForTextureName(tex.name);
+		if (found.entry == nullptr)
 			continue;
 
 		std::vector<uint8_t> data;
 		try
 		{
-			data = archive_->ExtractEntry(*found);
+			data = found.archive->ExtractEntry(*found.entry);
 		}
 		catch (const std::exception &)
 		{
 			continue;
 		}
 
-		const QImage image = DecodeImageData(data, ExtensionOf(*found));
+		const QImage image = DecodeImageData(data, ExtensionOf(*found.entry));
 		if (image.isNull())
 			continue;
 
 		model->SetTextureImage(static_cast<int>(i), image);
-		externalTextureSources_[i] = QString::fromStdU16String(found->path);
+		// Record which pak the texture actually came from -- with duplicates
+		// across updates this is the only way to tell sources apart.
+		const QString pakName = QString::fromStdU16String(found.archive->SourceFileName());
+		externalTextureSources_[i] = pakName + QStringLiteral(":")
+			+ QString::fromStdU16String(found.entry->path);
 	}
 }
 
@@ -1294,25 +1528,16 @@ void MainWindow::LoadTexturesFromFolder()
 	if (!currentModel_)
 		return;
 
-	const auto &textures = currentModel_->Textures();
-	std::vector<int> unresolved;
-	for (size_t i = 0; i < textures.size(); ++i)
-	{
-		// Only textures ResolveExternalTextures didn't already bind from
-		// inside the pak -- reprocessing an already-resolved one would just
-		// redo work, and risks overwriting a good match with an unrelated
-		// same-named file if the picked folder happens to contain one.
-		const bool alreadyResolved = i < externalTextureSources_.size() && !externalTextureSources_[i].isEmpty();
-		if (TextureLooksExternal(textures[i]) && !alreadyResolved)
-			unresolved.push_back(static_cast<int>(i));
-	}
-	if (unresolved.empty())
-		return;
-
 	const QString dir = QFileDialog::getExistingDirectory(this,
 		tr("Choose a folder containing the model textures"));
 	if (dir.isEmpty())
 		return;
+
+	// Remember the folder (persisted across restarts) and reuse it
+	// automatically for every subsequently opened model.
+	textureFolder_ = dir;
+	QSettings settings;
+	settings.setValue(QStringLiteral("textureFolder"), dir);
 
 	// Walk the folder once and reuse the listing for every unresolved
 	// texture, instead of a fresh recursive scan per texture.
@@ -1321,10 +1546,97 @@ void MainWindow::LoadTexturesFromFolder()
 	while (it.hasNext())
 		files << it.next();
 
-	int loaded = 0;
-	for (const int i : unresolved)
+	const int loaded = ResolveTexturesFromFolderFiles(currentModel_, files);
+
+	// Refresh the 3D view (its GPU texture cache is keyed off the old
+	// placeholder images) and the texture controls.
+	if (loaded > 0)
 	{
-		const auto &tex = textures[static_cast<size_t>(i)];
+		modelView_->ReloadTextures();
+		RebuildModelControls();
+	}
+
+	statusBar()->showMessage(loaded > 0
+		? tr("Loaded %1 external texture(s) from %2").arg(loaded).arg(dir)
+		: tr("No textures matching this .mdl were found in %1").arg(dir), 6000);
+}
+
+void MainWindow::ApplyRememberedTextureFolder(
+	const std::shared_ptr<cso_gui::StudioModel> &model)
+{
+	if (!model)
+		return;
+
+	auto hasUnresolved = [&]()
+		{
+			const auto &textures = model->Textures();
+			for (size_t i = 0; i < textures.size(); ++i)
+			{
+				const bool alreadyResolved =
+					i < externalTextureSources_.size() && !externalTextureSources_[i].isEmpty();
+				if (TextureLooksExternal(textures[i]) && !alreadyResolved)
+					return true;
+			}
+			return false;
+		};
+
+	auto scanDir = [&](const QString &dir)
+		{
+			QStringList files;
+			QDirIterator it(dir, QDir::Files, QDirIterator::Subdirectories);
+			while (it.hasNext())
+				files << it.next();
+			return ResolveTexturesFromFolderFiles(model, files);
+		};
+
+	// Candidate folders, in priority order: the remembered folder first,
+	// then the bundled "textures" folder next to the executable.
+	QStringList candidates;
+	if (!textureFolder_.isEmpty() && QDir(textureFolder_).exists())
+		candidates << textureFolder_;
+	const QString bundled = BundledTextureFolder();
+	if (!bundled.isEmpty() && !candidates.contains(bundled, Qt::CaseInsensitive))
+		candidates << bundled;
+
+	int loaded = 0;
+	QStringList usedDirs;
+	for (const QString &dir : candidates)
+	{
+		// Walk a folder only when something is still unresolved.
+		if (!hasUnresolved())
+			break;
+		const int count = scanDir(dir);
+		if (count > 0)
+		{
+			loaded += count;
+			usedDirs << dir;
+		}
+	}
+
+	if (loaded > 0)
+		statusBar()->showMessage(tr("Loaded %1 external texture(s) from %2")
+			.arg(loaded).arg(usedDirs.join(QStringLiteral(", "))), 6000);
+}
+
+int MainWindow::ResolveTexturesFromFolderFiles(
+	const std::shared_ptr<cso_gui::StudioModel> &model, const QStringList &files)
+{
+	if (!model)
+		return 0;
+
+	const auto &textures = model->Textures();
+	int loaded = 0;
+	for (size_t i = 0; i < textures.size(); ++i)
+	{
+		// Only textures that aren't already bound -- reprocessing a resolved
+		// one would just redo work, and risks overwriting a good match with
+		// an unrelated same-named file.
+		const bool alreadyResolved =
+			i < externalTextureSources_.size() && !externalTextureSources_[i].isEmpty();
+		if (!TextureLooksExternal(textures[i]) || alreadyResolved)
+			continue;
+
+		const auto &tex = textures[i];
 		QString foundPath;
 		for (const QString &candidate : files)
 		{
@@ -1341,23 +1653,13 @@ void MainWindow::LoadTexturesFromFolder()
 		if (image.isNull())
 			continue;
 
-		currentModel_->SetTextureImage(i, image);
+		model->SetTextureImage(static_cast<int>(i), image);
 		if (static_cast<size_t>(i) < externalTextureSources_.size())
 			externalTextureSources_[static_cast<size_t>(i)] = foundPath;
 		++loaded;
 	}
 
-	// Refresh the 3D view (its GPU texture cache is keyed off the old
-	// placeholder images) and the texture controls.
-	if (loaded > 0)
-	{
-		modelView_->ReloadTextures();
-		RebuildModelControls();
-	}
-
-	statusBar()->showMessage(loaded > 0
-		? tr("Loaded %1 external texture(s) from %2").arg(loaded).arg(dir)
-		: tr("No textures matching this .mdl were found in %1").arg(dir), 6000);
+	return loaded;
 }
 
 void MainWindow::StopModelPlayback()
@@ -2067,7 +2369,8 @@ void MainWindow::ShowWadLumpPreview(int wadArchiveIndex, int wadEntryIndex)
 	ShowWadLumpProperties(lump, tr("Not a recognized texture (miptex) lump."));
 }
 
-void MainWindow::ShowPreviewForEntry(const cso_pak::PakArchive::Entry &entry)
+void MainWindow::ShowPreviewForEntry(const cso_pak::PakArchive *archive,
+	const cso_pak::PakArchive::Entry &entry)
 {
 	StopMediaPlayback();
 	StopModelPlayback();
@@ -2082,7 +2385,7 @@ void MainWindow::ShowPreviewForEntry(const cso_pak::PakArchive::Entry &entry)
 	std::vector<uint8_t> data;
 	try
 	{
-		data = archive_->ExtractEntry(entry);
+		data = archive->ExtractEntry(entry);
 	}
 	catch (const std::exception &ex)
 	{
@@ -2154,6 +2457,17 @@ void MainWindow::ShowPreviewForEntry(const cso_pak::PakArchive::Entry &entry)
 
 	if (ext == QLatin1String("mdl"))
 	{
+		// Remember which archive this model came from so texture lookup
+		// can prefer the same pak before searching the neighbours.
+		currentModelPakIndex_ = -1;
+		for (int i = 0; i < static_cast<int>(archives_.size()); ++i)
+		{
+			if (archives_[static_cast<size_t>(i)].get() == archive)
+			{
+				currentModelPakIndex_ = i;
+				break;
+			}
+		}
 		ShowModel(entry, data);
 		return;
 	}
