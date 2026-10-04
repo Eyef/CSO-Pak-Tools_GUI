@@ -45,6 +45,8 @@ protected:
 
 private slots:
 	void OnOpenPak();
+	void OnOpenPaks();
+	void OnOpenPakFolder();
 	void OnExtractAll();
 	void OnExtractSelected();
 	void OnExtractSelectedDecoded();
@@ -80,10 +82,23 @@ private:
 	void BuildUi();
 	void BuildMenusAndToolbar();
 	void LoadPak(const QString &path);
+	void LoadPaks(const QStringList &paths);
+	bool HasArchives() const { return !archives_.empty(); }
+	size_t TotalEntryCount() const;
 	void AddRecentFile(const QString &path);
 	void UpdateRecentFilesMenu();
 
-	void ShowPreviewForEntry(const cso_pak::PakArchive::Entry &entry);
+	// Reference to one concrete entry inside one concrete loaded archive.
+	struct ArchiveEntryRef
+	{
+		const cso_pak::PakArchive *archive = nullptr;
+		const cso_pak::PakArchive::Entry *entry = nullptr;
+	};
+
+	ArchiveEntryRef ResolveIndex(const QModelIndex &index) const;
+
+	void ShowPreviewForEntry(const cso_pak::PakArchive *archive,
+		const cso_pak::PakArchive::Entry &entry);
 	void ShowPlaceholder(const QString &message);
 	void ShowText(const QString &text);
 	void ShowImage(const QImage &image);
@@ -103,8 +118,16 @@ private:
 	static QImage DecodeImageData(const std::vector<uint8_t> &data, const QString &extension);
 	static QImage DecodeImageFile(const QString &path);
 	static bool FileMatchesTextureName(const QString &path, const std::string &textureName);
-	const cso_pak::PakArchive::Entry *FindArchiveEntryForTextureName(const std::string &textureName) const;
+	ArchiveEntryRef FindArchiveEntryForTextureName(const std::string &textureName) const;
 	void ResolveExternalTextures(const std::shared_ptr<cso_gui::StudioModel> &model);
+	// Applies textures from the remembered folder (if any) to textures that
+	// are still unresolved. Called automatically for every opened model so
+	// the folder doesn't have to be re-picked per model.
+	void ApplyRememberedTextureFolder(const std::shared_ptr<cso_gui::StudioModel> &model);
+	// Binds unresolved external textures of `model` from a pre-scanned file
+	// listing. Returns how many textures were loaded.
+	int ResolveTexturesFromFolderFiles(const std::shared_ptr<cso_gui::StudioModel> &model,
+		const QStringList &files);
 	void ShowSprite(const cso_pak::PakArchive::Entry &entry, const std::vector<uint8_t> &data);
 	void StopSpritePlayback();
 	void UpdateSpriteFrameDisplay();
@@ -114,9 +137,11 @@ private:
 	void ShowProperties(const cso_pak::PakArchive::Entry &entry, const QString &note = QString());
 	void UpdateImageDisplay();
 
-	void ExtractOneWithDialog(const cso_pak::PakArchive::Entry &entry);
-	void ExtractIndicesToDirectory(const std::vector<int> &entryIndices, const QString &destRoot, bool decodeCso = false);
-	std::vector<int> CollectSelectedEntryIndices() const;
+	void ExtractOneWithDialog(const cso_pak::PakArchive *archive,
+		const cso_pak::PakArchive::Entry &entry);
+	void ExtractIndicesToDirectory(const std::vector<PakTreeModel::ResolvedRef> &refs,
+		const QString &destRoot, bool decodeCso = false);
+	std::vector<PakTreeModel::ResolvedRef> CollectSelectedRefs() const;
 
 	static QString ExtensionOf(const cso_pak::PakArchive::Entry &entry);
 	static bool LooksLikeText(const std::vector<uint8_t> &data);
@@ -129,7 +154,14 @@ private:
 	// empty string if the entry path can't be made safe.
 	static QString SanitizedRelativePath(const std::u16string &entryPath);
 
-	std::unique_ptr<cso_pak::PakArchive> archive_;
+	std::vector<std::unique_ptr<cso_pak::PakArchive>> archives_;
+	// Archive index (into archives_) the currently previewed model came
+	// from. Texture lookup prefers this archive first, then the rest.
+	int currentModelPakIndex_ = -1;
+	// Texture folder picked via "Load textures from folder". Remembered
+	// (including across restarts via QSettings) and auto-applied to every
+	// subsequently opened model with unresolved textures.
+	QString textureFolder_;
 	PakTreeModel *model_ = nullptr;
 
 	QTreeView *treeView_ = nullptr;
