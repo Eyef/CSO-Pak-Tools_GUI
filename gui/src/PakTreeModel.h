@@ -28,15 +28,29 @@ class PakTreeModel : public QAbstractItemModel
 public:
 	explicit PakTreeModel(QObject *parent = nullptr);
 
-	// Rebuilds the tree from the given archive. The archive must outlive
-	// the model (MainWindow keeps it alive for as long as the model is used).
+	// Rebuilds the tree from the given archives. The archives must outlive
+	// the model (MainWindow keeps them alive for as long as the model is used).
+	// Folders with the same virtual path are merged; files with the same
+	// virtual path from different archives are all shown as siblings, so no
+	// duplicate is hidden -- use the Source column/tooltip to tell them apart.
+	void SetArchives(const std::vector<const cso_pak::PakArchive*> &archives);
 	void SetArchive(const cso_pak::PakArchive *archive);
 
-	// Returns the entry index (into archive->Entries()) for a plain pak file
-	// node (this includes a .wad's own node, which is both a normal
-	// extractable pak entry AND expandable into its lumps), or -1 for a
-	// folder or a WAD-lump node.
+	// A reference to one concrete file in one concrete archive.
+	struct ResolvedRef
+	{
+		int pakIndex = -1;    // Index into the archives passed to SetArchives().
+		int entryIndex = -1;  // Index into that archive's Entries().
+	};
+
+	// Returns the entry index (into its own archive's Entries()) for a plain
+	// pak file node (this includes a .wad's own node), or -1 for a folder or
+	// a WAD-lump node.
 	int EntryIndexForIndex(const QModelIndex &index) const;
+	// Index of the archive this node came from, or -1 for folders/invalid.
+	int PakIndexForIndex(const QModelIndex &index) const;
+	// Archive this node came from, or nullptr for folders/invalid.
+	const cso_pak::PakArchive *ArchiveForIndex(const QModelIndex &index) const;
 
 	bool IsFolder(const QModelIndex &index) const;
 
@@ -50,12 +64,12 @@ public:
 	int WadEntryIndexForIndex(const QModelIndex &index) const;
 	const cso_gui::Wad3Archive *WadArchiveAt(int wadArchiveIndex) const;
 
-	// Returns the entry index of `index` itself if it's a plain file, or the
-	// entry indices of every plain file nested under it if it's a folder
+	// Returns the resolved (pak, entry) refs of `index` itself if it's a
+	// plain file, or of every plain file nested under it if it's a folder
 	// (including the whole tree when `index` is invalid, i.e. the root).
 	// WAD-lump nodes are skipped -- they aren't real top-level pak entries,
 	// so there's nothing here to extract them as (see README).
-	std::vector<int> CollectEntryIndices(const QModelIndex &index) const;
+	std::vector<ResolvedRef> CollectResolvedRefs(const QModelIndex &index) const;
 
 	QModelIndex index(int row, int column, const QModelIndex &parent = QModelIndex()) const override;
 	QModelIndex parent(const QModelIndex &child) const override;
@@ -78,6 +92,7 @@ private:
 		Node *parent = nullptr;
 		std::vector<std::unique_ptr<Node>> children;
 		NodeKind kind = NodeKind::Folder;
+		int pakIndex = -1;        // Valid when kind == PakFile or WadLump.
 		int entryIndex = -1;      // Valid when kind == PakFile.
 		int wadArchiveIndex = -1; // Valid when kind == WadLump, or on a parsed .wad's own PakFile node.
 		int wadEntryIndex = -1;   // Valid when kind == WadLump.
@@ -88,10 +103,11 @@ private:
 	Node *NodeFromIndex(const QModelIndex &index) const;
 	Node *FindOrCreateFolder(Node *parent, const QString &name);
 	void SortChildrenRecursive(Node *node);
-	static void CollectEntryIndicesRecursive(const Node *node, std::vector<int> &out);
-	void AddWadChildrenIfApplicable(Node *fileNode, int entryIndex);
+	static void CollectResolvedRefsRecursive(const Node *node, std::vector<ResolvedRef> &out);
+	void AddWadChildrenIfApplicable(Node *fileNode, const cso_pak::PakArchive *archive, int entryIndex);
+	QString SourceNameForPak(int pakIndex) const;
 
-	const cso_pak::PakArchive *archive_ = nullptr;
+	std::vector<const cso_pak::PakArchive*> archives_;
 	std::unique_ptr<Node> root_;
 	std::vector<std::unique_ptr<cso_gui::Wad3Archive>> wadArchives_;
 	QIcon folderIcon_;
