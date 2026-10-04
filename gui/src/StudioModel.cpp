@@ -251,11 +251,17 @@ namespace cso_gui
 		if (h.numSkinRef <= 0 || h.numSkinFamilies <= 0 || h.skinIndex <= 0)
 			return;
 
+		// The skin table is numSkinFamilies rows of numSkinRef shorts:
+		// short index[skinfamilies][skinref] (see HLAM's StudioModelFileFormat
+		// and ConvertSkinFamiliesToEditable). Every row must be read -- with
+		// only the first row, any family > 0 indexes into the wrong row or
+		// past the end, so Skin 1 renders the wrong/missing textures.
 		const size_t count = static_cast<size_t>(h.numSkinRef) * h.numSkinFamilies;
 		if (!InRange(static_cast<size_t>(h.skinIndex), count * sizeof(int16_t), size_))
 			throw std::runtime_error("model: skin table out of range");
 
-		for (int i = 0; i < h.numSkinRef; ++i)
+		skinRefs_.reserve(count);
+		for (size_t i = 0; i < count; ++i)
 		{
 			int16_t ref;
 			std::memcpy(&ref, base_ + h.skinIndex + i * sizeof(int16_t), sizeof(ref));
