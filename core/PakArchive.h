@@ -68,18 +68,22 @@ namespace cso_pak
 		// list entries and preview individual files without unpacking the
 		// whole archive to disk.
 		const std::filesystem::path &SourcePath() const { return sourcePath_; }
+		const std::u16string &SourceFileName() const { return sourceFilename_; }
 		const std::vector<Entry> &Entries() const { return entries_; }
 
 		// Decrypts (and, for entries that are not compressed, trims) a single
-		// entry's data straight from the in-memory archive buffer. Throws
-		// std::runtime_error for entries whose type has the Compressed flag
+		// entry's data, reading only that entry's blob from the source file.
+		// The archive keeps just the entry table in memory, so hundreds of
+		// archives can stay open at once without holding gigabytes of data.
+		// Throws std::runtime_error for entries whose type has the Compressed flag
 		// set, since compressed payloads are not supported yet.
 		std::vector<uint8_t> ExtractEntry(const Entry &entry) const;
 
 	private:
+		std::vector<uint8_t> ReadEntryBlob(const Entry &entry) const;
+
 		std::filesystem::path sourcePath_;
 		std::u16string sourceFilename_;
-		std::vector<uint8_t> buffer_;
 		std::vector<Entry> entries_;
 		size_t dataStartOffset_ = 0;
 
