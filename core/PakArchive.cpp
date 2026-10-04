@@ -260,6 +260,31 @@ namespace
 		return data;
 	}
 
+	// Reads a byte range from a file without loading the whole file.
+	// Used for on-demand entry data reads so many archives can stay
+	// indexed at once (e.g. a whole Packer folder of 500+ paks).
+	std::vector<uint8_t> ReadRange(const std::filesystem::path &path, size_t offset, size_t size)
+	{
+		if (size == 0)
+			return {};
+
+		std::ifstream input(path, std::ios::binary);
+		if (!input)
+			throw std::runtime_error("failed to open input file: " + path.string());
+
+		input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+		if (!input)
+			throw std::runtime_error("failed to seek input file: " + path.string());
+
+		std::vector<uint8_t> data(size);
+		input.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(data.size()));
+		const auto got = input.gcount();
+		if (got != static_cast<std::streamsize>(data.size()))
+			throw std::runtime_error("entry data is outside source pak: " + path.string());
+
+		return data;
+	}
+
 	void WriteFile(const std::filesystem::path &path, std::span<const uint8_t> data)
 	{
 		if (!path.parent_path().empty())
@@ -460,20 +485,6 @@ namespace
 		return header;
 	}
 
-	// FileOffset is a 0x400-byte block index from the data section, not an
-	// absolute file offset. PackedSize is the exact encrypted payload length.
-	std::vector<uint8_t> CopyOriginalBlob(const std::vector<uint8_t> &source,
-		size_t dataStartOffset, const PakArchive::Entry &entry)
-	{
-		const size_t startOffset = dataStartOffset + (static_cast<size_t>(entry.fileOffset) << 10);
-		const size_t endOffset = startOffset + entry.packedSize;
-		if (startOffset > source.size() || endOffset > source.size())
-			throw std::runtime_error("entry data is outside source pak: " + Utf16ToUtf8(entry.path));
-
-		return { source.begin() + static_cast<std::ptrdiff_t>(startOffset),
-			source.begin() + static_cast<std::ptrdiff_t>(endOffset) };
-	}
-
 	void EncryptEntryData(const PakArchive::Entry &entry, std::vector<uint8_t> &data)
 	{
 		const auto dataKey = GenerateDataKey(entry.path, entry.baseKey);
@@ -643,7 +654,7 @@ namespace
 	}
 
 	PackedEntry BuildPackedEntry(const PakArchive::Entry &sourceEntry,
-		const std::vector<uint8_t> &sourceBuffer, size_t dataStartOffset,
+		std::vector<uint8_t> originalBlob,
 		const std::filesystem::path &replacementRoot, size_t nextDataBlock)
 	{
 		PackedEntry packed;
@@ -656,7 +667,7 @@ namespace
 
 		if (!std::filesystem::exists(replacementPath))
 		{
-			packed.encryptedData = CopyOriginalBlob(sourceBuffer, dataStartOffset, sourceEntry);
+			packed.encryptedData = std::move(originalBlob);
 			// Preserved blobs still need a refreshed checksum because FileOffset changed.
 			RefreshEntryChecksum(packed.entry);
 			return packed;
@@ -735,15 +746,18 @@ PakArchive PakArchive::Load(const std::filesystem::path &pakPath)
 	PakArchive archive;
 	archive.sourcePath_ = pakPath;
 	archive.sourceFilename_ = pakPath.filename().generic_u16string();
-	archive.buffer_ = ReadFile(pakPath);
+	// The full file is only needed to parse the header and entry table;
+	// entry payloads are read on demand afterwards, so the buffer is
+	// released before returning.
+	std::vector<uint8_t> buffer = ReadFile(pakPath);
 
 	const size_t headerOffset = HeaderOffset(archive.sourceFilename_);
-	if (headerOffset + HeaderSize > archive.buffer_.size())
+	if (headerOffset + HeaderSize > buffer.size())
 		throw std::runtime_error("pak is too small for header");
 
 	std::array<uint8_t, HeaderSize> header = {};
 	std::ranges::copy_n(
-		archive.buffer_.begin() + static_cast<std::ptrdiff_t>(headerOffset),
+		buffer.begin() + static_cast<std::ptrdiff_t>(headerOffset),
 		HeaderSize,
 		header.begin());
 	DecryptAligned(header, GenerateHeaderKey(archive.sourceFilename_));
@@ -755,11 +769,11 @@ PakArchive PakArchive::Load(const std::filesystem::path &pakPath)
 		throw std::runtime_error("invalid pak header or wrong source filename");
 
 	const size_t entriesOffset = EntriesOffset(archive.sourceFilename_, headerOffset);
-	if (entriesOffset >= archive.buffer_.size())
+	if (entriesOffset >= buffer.size())
 		throw std::runtime_error("entry table offset is outside pak");
 
-	EntryReader reader({ archive.buffer_.data() + entriesOffset,
-		archive.buffer_.size() - entriesOffset }, GenerateEntriesKey(archive.sourceFilename_));
+	EntryReader reader({ buffer.data() + entriesOffset,
+		buffer.size() - entriesOffset }, GenerateEntriesKey(archive.sourceFilename_));
 	archive.entries_.reserve(entryCount);
 
 	for (uint32_t i = 0; i < entryCount; ++i)
@@ -787,7 +801,7 @@ PakArchive PakArchive::Load(const std::filesystem::path &pakPath)
 
 	// Data starts after the encrypted entry stream and is aligned to 0x400 bytes.
 	archive.dataStartOffset_ = AlignUp(entriesOffset + reader.EncryptedOffset(), DataBlockSize);
-	if (archive.dataStartOffset_ > archive.buffer_.size())
+	if (archive.dataStartOffset_ > buffer.size())
 		throw std::runtime_error("data start offset is outside pak");
 
 	return archive;
@@ -803,7 +817,7 @@ UnpackStats PakArchive::UnpackToDirectory(const std::filesystem::path &outputRoo
 	for (const auto &entry : entries_)
 	{
 		const auto relativePath = SafeRelativePath(entry.path);
-		auto encryptedData = CopyOriginalBlob(buffer_, dataStartOffset_, entry);
+		auto encryptedData = ReadEntryBlob(entry);
 		auto plain = DecryptEntryData(entry, std::move(encryptedData));
 		WriteFile(outputRoot / relativePath, plain);
 		++stats.writtenEntries;
@@ -840,11 +854,19 @@ PackStats PakArchive::PackDirectory(const std::filesystem::path &inputRoot,
 	return stats;
 }
 
+std::vector<uint8_t> PakArchive::ReadEntryBlob(const Entry &entry) const
+{
+	// FileOffset is a 0x400-byte block index from the data section, not an
+	// absolute file offset. PackedSize is the exact encrypted payload length.
+	const size_t startOffset = dataStartOffset_ + (static_cast<size_t>(entry.fileOffset) << 10);
+	return ReadRange(sourcePath_, startOffset, entry.packedSize);
+}
+
 std::vector<uint8_t> PakArchive::ExtractEntry(const Entry &entry) const
 {
 	// Same steps as UnpackToDirectory for one entry, kept in memory instead
 	// of being written to disk. Used by preview/browsing tools.
-	auto encryptedData = CopyOriginalBlob(buffer_, dataStartOffset_, entry);
+	auto encryptedData = ReadEntryBlob(entry);
 	return DecryptEntryData(entry, std::move(encryptedData));
 }
 
@@ -863,7 +885,7 @@ PatchStats PakArchive::PatchFromDirectory(const std::filesystem::path &replaceme
 	for (const auto &sourceEntry : entries_)
 	{
 		// This counter is the next FileOffset value, measured in 0x400-byte blocks.
-		auto packed = BuildPackedEntry(sourceEntry, buffer_, dataStartOffset_,
+		auto packed = BuildPackedEntry(sourceEntry, ReadEntryBlob(sourceEntry),
 			replacementRoot, dataBlockCount);
 
 		if (packed.replaced)
