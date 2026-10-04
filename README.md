@@ -58,6 +58,13 @@ that and shows it as a note in the properties panel instead of crashing.
 menu items just call them directly, same as the console tool's `pack`/`patch`
 commands.
 
+`Load` no longer keeps the whole file in memory: after parsing the header
+and entry table the buffer is released, and `ExtractEntry` /
+`UnpackToDirectory` / `PatchFromDirectory` read each entry's byte range
+straight from disk on demand. The public API is unchanged, but this is what
+lets the GUI keep hundreds of archives open at once without holding
+gigabytes of payload data in RAM.
+
 ## Building with Visual Studio 2022 + Qt6
 
 1. Install Qt6 via the Qt Online Installer, picking the **MSVC 2022 64-bit**
@@ -123,7 +130,22 @@ whole step.
 
 ## Using the browser
 
-- **File → Open Pak...** loads a `.pak` and populates the tree.
+- **File → Open Pak...** loads a single `.pak` and populates the tree.
+- **File → Open Multiple Paks...** loads several `.pak` files at once;
+  **File → Open Pak Folder...** loads every `.pak` in a folder (e.g. the
+  game's whole `Data/Packer` directory — several hundred archives work
+  fine). All loaded archives appear as **one merged tree**: folders with
+  the same virtual path are combined, and files with the same virtual path
+  from different archives are all shown side by side — no duplicate is
+  hidden and no "newest pak wins" rule is applied, since game updates
+  scatter newer copies of files across archives unpredictably. Use the
+  tooltip (hover) or the status bar (click a file) to see which concrete
+  `.pak` a given entry came from: `lstrike/.../v_usp.mdl — common_00137.pak`.
+  Loading shows a progress dialog with Cancel; archives that fail to parse
+  are reported in a list at the end instead of aborting the whole batch.
+  Only each archive's entry table is kept in memory — file bytes are read
+  from disk on demand when you preview or extract something — so opening
+  hundreds of archives (several GB on disk) doesn't balloon RAM usage.
 - **File → Recent Files** lists the last 10 successfully opened `.pak`
   paths (newest first), persisted across restarts via `QSettings` — handy
   with a large collection of pak files where you keep going back to a
@@ -233,13 +255,21 @@ whole step.
     indices aren't comparable across files).
     Some models only *name* a texture (CSO's own convention: a `#`-prefixed
     name, or a tiny placeholder image like 4×1) and ship the real pixels as
-    a separate loose file elsewhere in the same pak — the tool searches the
-    open archive for a same-named file (any common image extension, not
-    just the exact one named) and swaps it in automatically before the
+    a separate loose file elsewhere in the same pak — the tool searches
+    every loaded archive for a same-named file (the `#` marker is ignored
+    while matching, and any common image extension matches, not just the
+    exact one named — the model's own archive is tried first) and swaps it
+    in automatically before the
     model is shown. When that search comes up empty, the panel lists
     exactly which textures are still missing and a **Load textures from
     folder...** button lets you point at a folder (e.g. an extracted/loose
-    texture dump) to resolve them by hand instead.
+    texture dump) to resolve them by hand instead. The picked folder is
+    remembered (across restarts too) and applied automatically to every
+    subsequently opened model, so you don't re-pick it per weapon. As a
+    last fallback, a `textures/` folder placed next to the exe is also
+    searched automatically — handy for bundling hand-found textures (like
+    the `HighQ` hand variants) with the program so other people get them
+    working out of the box.
     A parse failure (unsupported version, corrupt file, etc.) falls back to
     the properties panel with the error instead of crashing.
   - `.spr` → decoded with `SpriteImage` and played back frame by frame
@@ -252,9 +282,13 @@ whole step.
     stretched up to fill the window.
   - Everything else (compressed entries, unrecognized binary formats) → a
     properties panel with path, sizes, type flags, base key, checksum.
-- **File → Extract All...** — same as the console tool's `unpack` command.
+- **File → Extract All...** — same as the console tool's `unpack` command
+  (in multi-pak mode: the whole merged tree; same virtual paths coming
+  from different archives are all written, later ones with a
+  `__from_<pakname>` suffix instead of overwriting each other).
 - **File → Extract Selected...** / right-click a selection — extracts just
-  the selected files/folders (recursing into folders) to a folder you pick.
+  the selected files/folders (recursing into folders) to a folder you pick
+  (same `__from_<pakname>` disambiguation for duplicates).
 - **File → Extract Selected (Decode .cso to CSV)...** — same selection
   logic, but any `.cso` entries in the selection get the same TEA-decrypt +
   Korean-detection treatment as the preview, and are written out as `.csv`
