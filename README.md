@@ -267,9 +267,7 @@ whole step.
     remembered (across restarts too) and applied automatically to every
     subsequently opened model, so you don't re-pick it per weapon. As a
     last fallback, a `textures/` folder placed next to the exe is also
-    searched automatically — handy for bundling hand-found textures (like
-    the `HighQ` hand variants) with the program so other people get them
-    working out of the box.
+    searched automatically.
     A parse failure (unsupported version, corrupt file, etc.) falls back to
     the properties panel with the error instead of crashing.
   - `.spr` → decoded with `SpriteImage` and played back frame by frame
