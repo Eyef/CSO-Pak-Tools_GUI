@@ -47,6 +47,7 @@ uniform vec3 uLightDir;
 uniform vec3 uFillLightDir;
 uniform vec4 uColor;
 uniform float uUnlit;
+uniform float uChrome;
 out vec4 FragColor;
 void main()
 {
@@ -61,7 +62,7 @@ void main()
 	float light = min(0.35 + 0.65 * diffMain + 0.35 * diffFill, 1.0);
 	vec4 base = vec4(uColor.rgb, 1.0);
 	if (uUseTex > 0.5)
-		base = texture(uTexture, vTexCoord);
+		base = texture(uTexture, uChrome > 0.5 ? n.xy * 0.5 + 0.5 : vTexCoord);
 	if (base.a < 0.5)
 		discard;
 	// Additive/glow textures (STUDIO_NF_ADDITIVE, e.g. fire, eye glow,
@@ -313,7 +314,10 @@ void main()
 		// file's own STUDIO_NF_ADDITIVE flag isn't set.
 		const QString name = QString::fromStdString(tex.name);
 		if (name.startsWith(QStringLiteral("$0a"), Qt::CaseInsensitive) ||
-			name.startsWith(QStringLiteral("$0b"), Qt::CaseInsensitive))
+			name.startsWith(QStringLiteral("$0b"), Qt::CaseInsensitive) ||
+			// "ef_" = effect textures (e.g. ef_sewerhole*.bmp): black is
+			// transparent, no flag set in the file.
+			name.startsWith(QStringLiteral("ef_"), Qt::CaseInsensitive))
 			return AdditiveSource::NamePrefix;
 
 		return AdditiveSource::None;
@@ -520,6 +524,7 @@ void main()
 		lightDirLoc_ = program_->uniformLocation("uLightDir");
 		fillLightDirLoc_ = program_->uniformLocation("uFillLightDir");
 		unlitLoc_ = program_->uniformLocation("uUnlit");
+		chromeLoc_ = program_->uniformLocation("uChrome");
 		texLoc_ = program_->uniformLocation("uTexture");
 		useTexLoc_ = program_->uniformLocation("uUseTex");
 		colorLoc_ = program_->uniformLocation("uColor");
@@ -598,6 +603,9 @@ void main()
 				auto gpu = std::make_unique<GpuMesh>();
 				gpu->texture = texIndex;
 				gpu->additive = IsTextureAdditive(texIndex);
+				gpu->chrome = texIndex >= 0 &&
+					texIndex < static_cast<int>(model_->Textures().size()) &&
+					(model_->Textures()[static_cast<size_t>(texIndex)].flags & 0x02) != 0;
 				gpu->count = static_cast<GLsizei>(mesh.triangles.size() * 3);
 				gpu->verts.reserve(static_cast<size_t>(gpu->count) * 8);
 				for (const auto &tri : mesh.triangles)
@@ -786,6 +794,7 @@ void main()
 
 		const auto bindMeshTexture = [&](const std::unique_ptr<GpuMesh> &gpu)
 		{
+			program_->setUniformValue(chromeLoc_, gpu->chrome ? 1.0f : 0.0f);
 			if (gpu->texture >= 0 && gpu->texture < static_cast<int>(textures_.size()) && !wireframe_)
 				textures_[static_cast<size_t>(gpu->texture)]->bind(0);
 			else if (!textures_.empty())

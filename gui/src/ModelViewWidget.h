@@ -137,6 +137,7 @@ namespace cso_gui
 		{
 			std::vector<float> verts;  // x,y,z,nx,ny,nz,u,v
 			int texture = -1;
+			bool chrome = false;       // STUDIO_NF_CHROME: env-mapped UVs
 			bool additive = false;     // STUDIO_NF_ADDITIVE texture (glow/particle FX)
 			QOpenGLVertexArrayObject vao;
 			QOpenGLBuffer vbo;
@@ -166,6 +167,7 @@ namespace cso_gui
 		int unlitLoc_ = -1;
 		int texLoc_ = -1;
 		int useTexLoc_ = -1;
+		int chromeLoc_ = -1;
 		int colorLoc_ = -1;
 
 		std::vector<int> bodyGroup_;  // selected submodel per bodypart

@@ -28,11 +28,68 @@ void PakTreeModel::SetArchive(const cso_pak::PakArchive *archive)
 
 void PakTreeModel::SetArchives(const std::vector<const cso_pak::PakArchive*> &archives)
 {
+	SetAllArchives(archives, {});
+}
+
+void PakTreeModel::SetNarArchives(const std::vector<const cso_pak::NarArchive*> &narArchives)
+{
+	SetAllArchives({}, narArchives);
+}
+
+void PakTreeModel::SetAllArchives(const std::vector<const cso_pak::PakArchive*> &archives,
+	const std::vector<const cso_pak::NarArchive*> &narArchives)
+{
 	beginResetModel();
 
 	archives_ = archives;
+	narArchives_ = narArchives;
+	Rebuild();
+
+	endResetModel();
+}
+
+void PakTreeModel::Rebuild()
+{
 	root_ = std::make_unique<Node>();
 	wadArchives_.clear();
+
+	const auto addFileNode = [&](const QString &path, int pakIndex, int narIndex, int entryIndex)
+	{
+		const QStringList parts = path.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+		if (parts.isEmpty())
+			return;
+
+		Node *current = root_.get();
+		for (int p = 0; p < parts.size() - 1; ++p)
+			current = FindOrCreateFolder(current, parts[p]);
+
+		auto fileNode = std::make_unique<Node>();
+		fileNode->name = parts.last();
+		fileNode->parent = current;
+		fileNode->kind = NodeKind::PakFile;
+		fileNode->pakIndex = pakIndex;
+		fileNode->narIndex = narIndex;
+		fileNode->entryIndex = entryIndex;
+		Node *fileNodeRaw = fileNode.get();
+		current->children.push_back(std::move(fileNode));
+
+		if (narIndex >= 0)
+		{
+			const auto *archive = (narIndex >= 0 &&
+				narIndex < static_cast<int>(narArchives_.size()))
+				? narArchives_[static_cast<size_t>(narIndex)]
+				: nullptr;
+			AddWadChildrenIfApplicable(fileNodeRaw, archive, entryIndex);
+		}
+		else
+		{
+			const auto *archive = (pakIndex >= 0 &&
+				pakIndex < static_cast<int>(archives_.size()))
+				? archives_[static_cast<size_t>(pakIndex)]
+				: nullptr;
+			AddWadChildrenIfApplicable(fileNodeRaw, archive, entryIndex);
+		}
+	};
 
 	for (int pakIndex = 0; pakIndex < static_cast<int>(archives_.size()); ++pakIndex)
 	{
@@ -42,33 +99,21 @@ void PakTreeModel::SetArchives(const std::vector<const cso_pak::PakArchive*> &ar
 
 		const auto &entries = archive->Entries();
 		for (int i = 0; i < static_cast<int>(entries.size()); ++i)
-		{
-			const auto &entry = entries[static_cast<size_t>(i)];
-			const QString path = QString::fromStdU16String(entry.path);
-			const QStringList parts = path.split(QLatin1Char('/'), Qt::SkipEmptyParts);
-			if (parts.isEmpty())
-				continue;
+			addFileNode(QString::fromStdU16String(entries[static_cast<size_t>(i)].path), pakIndex, -1, i);
+	}
 
-			Node *current = root_.get();
-			for (int p = 0; p < parts.size() - 1; ++p)
-				current = FindOrCreateFolder(current, parts[p]);
+	for (int narIndex = 0; narIndex < static_cast<int>(narArchives_.size()); ++narIndex)
+	{
+		const auto *archive = narArchives_[static_cast<size_t>(narIndex)];
+		if (archive == nullptr)
+			continue;
 
-			auto fileNode = std::make_unique<Node>();
-			fileNode->name = parts.last();
-			fileNode->parent = current;
-			fileNode->kind = NodeKind::PakFile;
-			fileNode->pakIndex = pakIndex;
-			fileNode->entryIndex = i;
-			Node *fileNodeRaw = fileNode.get();
-			current->children.push_back(std::move(fileNode));
-
-			AddWadChildrenIfApplicable(fileNodeRaw, archive, i);
-		}
+		const auto &entries = archive->Entries();
+		for (int i = 0; i < static_cast<int>(entries.size()); ++i)
+			addFileNode(QString::fromStdString(entries[static_cast<size_t>(i)].path), -1, narIndex, i);
 	}
 
 	SortChildrenRecursive(root_.get());
-
-	endResetModel();
 }
 
 void PakTreeModel::AddWadChildrenIfApplicable(Node *fileNode, const cso_pak::PakArchive *archive, int entryIndex)
@@ -118,6 +163,52 @@ void PakTreeModel::AddWadChildrenIfApplicable(Node *fileNode, const cso_pak::Pak
 	}
 }
 
+void PakTreeModel::AddWadChildrenIfApplicable(Node *fileNode, const cso_pak::NarArchive *archive, int entryIndex)
+{
+	if (archive == nullptr)
+		return;
+
+	const QString extension = QFileInfo(fileNode->name).suffix().toLower();
+	if (extension != QLatin1String("wad"))
+		return;
+
+	// Same graceful fallback as for .pak entries: an unparseable .wad stays
+	// a normal, non-expandable file node.
+	try
+	{
+		const auto &entry = archive->Entries()[static_cast<size_t>(entryIndex)];
+		auto data = archive->ExtractEntry(entry);
+		auto wad = std::make_unique<cso_gui::Wad3Archive>(cso_gui::Wad3Archive::Load(std::move(data)));
+
+		const int wadArchiveIndex = static_cast<int>(wadArchives_.size());
+		fileNode->wadArchiveIndex = wadArchiveIndex;
+
+		for (int i = 0; i < static_cast<int>(wad->Entries().size()); ++i)
+		{
+			const auto &lump = wad->Entries()[static_cast<size_t>(i)];
+
+			auto lumpNode = std::make_unique<Node>();
+			lumpNode->name = lump.name.empty()
+				? QStringLiteral("(unnamed lump %1)").arg(i)
+				: QString::fromStdString(lump.name);
+			lumpNode->parent = fileNode;
+			lumpNode->kind = NodeKind::WadLump;
+			lumpNode->pakIndex = fileNode->pakIndex;
+			lumpNode->narIndex = fileNode->narIndex;
+			lumpNode->wadArchiveIndex = wadArchiveIndex;
+			lumpNode->wadEntryIndex = i;
+			fileNode->children.push_back(std::move(lumpNode));
+		}
+
+		wadArchives_.push_back(std::move(wad));
+	}
+	catch (const std::exception &)
+	{
+		fileNode->wadArchiveIndex = -1;
+		fileNode->children.clear();
+	}
+}
+
 PakTreeModel::Node *PakTreeModel::FindOrCreateFolder(Node *parent, const QString &name)
 {
 	for (auto &child : parent->children)
@@ -153,8 +244,11 @@ void PakTreeModel::SortChildrenRecursive(Node *node)
 				return nameOrder < 0;
 
 			// Same virtual name from several archives: keep a stable order
-			// by source pak so duplicates don't shuffle between reloads.
-			return left->pakIndex < right->pakIndex;
+			// by source archive so duplicates don't shuffle between reloads
+			// (.pak sources sort before .nar ones).
+			const int leftSource = left->IsNar() ? 1000000 + left->narIndex : left->pakIndex;
+			const int rightSource = right->IsNar() ? 1000000 + right->narIndex : right->pakIndex;
+			return leftSource < rightSource;
 		});
 	}
 
@@ -189,6 +283,30 @@ int PakTreeModel::PakIndexForIndex(const QModelIndex &index) const
 		return -1;
 
 	return node->pakIndex;
+}
+
+bool PakTreeModel::IsNarFile(const QModelIndex &index) const
+{
+	const Node *node = NodeFromIndex(index);
+	return node != nullptr && node != root_.get() && !node->IsFolder() && node->IsNar();
+}
+
+int PakTreeModel::NarIndexForIndex(const QModelIndex &index) const
+{
+	const Node *node = NodeFromIndex(index);
+	if (node == nullptr || node == root_.get() || node->IsFolder())
+		return -1;
+
+	return node->narIndex;
+}
+
+const cso_pak::NarArchive *PakTreeModel::NarArchiveForIndex(const QModelIndex &index) const
+{
+	const int narIndex = NarIndexForIndex(index);
+	if (narIndex < 0 || narIndex >= static_cast<int>(narArchives_.size()))
+		return nullptr;
+
+	return narArchives_[static_cast<size_t>(narIndex)];
 }
 
 const cso_pak::PakArchive *PakTreeModel::ArchiveForIndex(const QModelIndex &index) const
@@ -238,6 +356,52 @@ const cso_gui::Wad3Archive *PakTreeModel::WadArchiveAt(int wadArchiveIndex) cons
 	return wadArchives_[static_cast<size_t>(wadArchiveIndex)].get();
 }
 
+QModelIndex PakTreeModel::FindEntryRecursive(const Node *node, int pakIndex,
+	int narIndex, int entryIndex) const
+{
+	for (int row = 0; row < static_cast<int>(node->children.size()); ++row)
+	{
+		const Node *child = node->children[static_cast<size_t>(row)].get();
+		if (child->kind == NodeKind::PakFile &&
+			child->entryIndex == entryIndex &&
+			child->pakIndex == pakIndex &&
+			child->narIndex == narIndex)
+		{
+			return createIndex(row, 0, const_cast<Node *>(child));
+		}
+
+		const QModelIndex found = FindEntryRecursive(child, pakIndex, narIndex, entryIndex);
+		if (found.isValid())
+			return found;
+	}
+
+	return QModelIndex();
+}
+
+QModelIndex PakTreeModel::FindEntry(int pakIndex, int narIndex, int entryIndex) const
+{
+	// Exactly one of the two archive indices is valid; -1 entry index is
+	// never a real file (folders and WAD lumps report -1 too).
+	if ((pakIndex < 0) == (narIndex < 0) || entryIndex < 0)
+		return QModelIndex();
+
+	return FindEntryRecursive(root_.get(), pakIndex, narIndex, entryIndex);
+}
+
+int PakTreeModel::NarIndexForArchive(const cso_pak::NarArchive *archive) const
+{
+	if (archive == nullptr)
+		return -1;
+
+	for (int i = 0; i < static_cast<int>(narArchives_.size()); ++i)
+	{
+		if (narArchives_[static_cast<size_t>(i)] == archive)
+			return i;
+	}
+
+	return -1;
+}
+
 void PakTreeModel::CollectResolvedRefsRecursive(const Node *node, std::vector<ResolvedRef> &out)
 {
 	if (node->kind == NodeKind::WadLump)
@@ -245,7 +409,12 @@ void PakTreeModel::CollectResolvedRefsRecursive(const Node *node, std::vector<Re
 
 	if (node->kind == NodeKind::PakFile)
 	{
-		out.push_back({ node->pakIndex, node->entryIndex });
+		ResolvedRef ref;
+		ref.pakIndex = node->pakIndex;
+		ref.narIndex = node->narIndex;
+		ref.entryIndex = node->entryIndex;
+		ref.isNar = node->IsNar();
+		out.push_back(ref);
 		return;
 	}
 
@@ -320,6 +489,27 @@ QString PakTreeModel::SourceNameForPak(int pakIndex) const
 	return QString::fromStdU16String(archive->SourceFileName());
 }
 
+QString PakTreeModel::SourceNameForNar(int narIndex) const
+{
+	if (narIndex < 0 || narIndex >= static_cast<int>(narArchives_.size()))
+		return QString();
+
+	const auto *archive = narArchives_[static_cast<size_t>(narIndex)];
+	if (archive == nullptr)
+		return QString();
+
+	return QString::fromStdString(archive->SourcePath().filename().string());
+}
+
+QString PakTreeModel::SourceNameForNode(const Node *node) const
+{
+	if (node == nullptr)
+		return QString();
+	if (node->IsNar())
+		return SourceNameForNar(node->narIndex);
+	return SourceNameForPak(node->pakIndex);
+}
+
 QVariant PakTreeModel::data(const QModelIndex &index, int role) const
 {
 	if (!index.isValid())
@@ -334,7 +524,7 @@ QVariant PakTreeModel::data(const QModelIndex &index, int role) const
 
 	if (role == Qt::ToolTipRole && !node->IsFolder())
 	{
-		const QString source = SourceNameForPak(node->pakIndex);
+		const QString source = SourceNameForNode(node);
 		if (source.isEmpty())
 			return node->name;
 		return tr("%1\nSource: %2").arg(node->name, source);

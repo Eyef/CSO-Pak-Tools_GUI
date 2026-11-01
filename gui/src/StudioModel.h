@@ -90,6 +90,7 @@ namespace cso_gui
 		struct BodyPart
 		{
 			std::string name;
+			int base = 1;  // body divisor: submodel = (body / base) % models.size()
 			std::vector<SubModel> models;
 		};
 
@@ -163,6 +164,13 @@ namespace cso_gui
 		// width/height to match. No-op for an out-of-range index or a null
 		// image.
 		void SetTextureImage(int index, const QImage &image);
+
+		// Imports the whole texture table (names, flags, pixels) from
+		// another model. For CSO's split world models: geometry-only files
+		// like w_50ae_big.mdl (no texture table, meshes reference skinrefs
+		// 0/1/...) pair with a w_50ae_bigt.mdl twin that holds nothing but
+		// the textures in matching order.
+		void ImportTexturesFrom(const StudioModel &other);
 
 	private:
 		struct Header;

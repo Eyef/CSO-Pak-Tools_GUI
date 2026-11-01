@@ -115,6 +115,13 @@ namespace cso_gui
 
 		base_ = data.data();
 		size_ = data.size();
+		// base_/size_ point into the caller's buffer: reset them on every
+		// exit path, including exceptions from the Parse* steps.
+		struct BaseGuard
+		{
+			StudioModel &model;
+			~BaseGuard() { model.base_ = nullptr; model.size_ = 0; }
+		} baseGuard{ *this };
 
 		if (Int(kOffId) != kStudioHeaderId)
 			throw std::runtime_error("model: not a studio model (bad IDST magic)");
@@ -144,6 +151,12 @@ namespace cso_gui
 		ParseSkins(h);
 		ParseBodyParts(h);
 		ParseSequences(h);
+
+		// base_ pointed into the caller's byte vector (often a temporary
+		// like found.extract()), so it dangles as soon as Load returns.
+		// Nothing reads it after parsing -- null it so any future misuse
+		// crashes loudly instead of reading freed memory.
+		base_ = nullptr;
 
 		valid_ = true;
 	}
@@ -239,9 +252,55 @@ namespace cso_gui
 			return;
 
 		Texture &tex = textures_[static_cast<size_t>(index)];
-		tex.image = image.convertToFormat(QImage::Format_ARGB32);
+		// Same rule as for embedded textures: in a masked texture (flag 0x40)
+		// the engine treats palette index 255 as transparent, whatever colour
+		// that palette slot holds (blue, green, pink...). External 8-bit BMPs
+		// keep their indices when Qt loads them as Indexed8, so apply it here
+		// before the image is converted to RGB and the indices are lost.
+		if ((tex.flags & 0x40) && image.format() == QImage::Format_Indexed8)
+		{
+			const QList<QRgb> colors = image.colorTable();
+			QImage out(image.width(), image.height(), QImage::Format_ARGB32);
+			for (int y = 0; y < image.height(); ++y)
+			{
+				const uchar *src = image.constScanLine(y);
+				QRgb *dst = reinterpret_cast<QRgb *>(out.scanLine(y));
+				for (int x = 0; x < image.width(); ++x)
+				{
+					const int idx = src[x];
+					dst[x] = (idx == 255)
+						? 0x00000000u
+						: (idx < colors.size() ? (colors[idx] | 0xFF000000u) : 0xFF000000u);
+				}
+			}
+			tex.image = std::move(out);
+		}
+		else
+		{
+			tex.image = image.convertToFormat(QImage::Format_ARGB32);
+		}
 		tex.width = tex.image.width();
 		tex.height = tex.image.height();
+	}
+
+	void StudioModel::ImportTexturesFrom(const StudioModel &other)
+	{
+		if (other.textures_.empty())
+			return;
+
+		textures_.clear();
+		for (const Texture &tex : other.textures_)
+		{
+			Texture copy;
+			copy.name = tex.name;
+			copy.flags = tex.flags;
+			copy.width = tex.width;
+			copy.height = tex.height;
+			copy.image = tex.image.isNull()
+				? QImage()
+				: tex.image.convertToFormat(QImage::Format_ARGB32);
+			textures_.push_back(std::move(copy));
+		}
 	}
 
 	void StudioModel::ParseSkins(const Header &h)
@@ -283,7 +342,11 @@ namespace cso_gui
 		// Precompute bone rest matrices in world space from the bone's own
 		// euler position/rotation, matching LocalBoneMatrix in ApplyFrame so
 		// the default pose reproduces exactly.
-		std::vector<std::array<float, 16>> boneMatrices(bones_.size());
+		// A model without bones still needs one identity matrix: vertices
+		// fall back to bone 0 below and must not index an empty vector.
+		std::vector<std::array<float, 16>> boneMatrices(
+			std::max<size_t>(bones_.size(), 1),
+			std::array<float, 16>{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 });
 		for (size_t i = 0; i < bones_.size(); ++i)
 		{
 			const Bone &bone = bones_[i];
@@ -342,6 +405,7 @@ namespace cso_gui
 			BodyPart part;
 			part.name = ReadFixedString(Ptr(off), kMaxBodyPartName);
 			const int numModels = Int(off + kMaxBodyPartName);
+			part.base = std::max(Int(off + kMaxBodyPartName + 4), 1);
 			const int modelIndex = Int(off + kMaxBodyPartName + 8);
 
 			if (numModels <= 0 || modelIndex <= 0)
@@ -436,6 +500,10 @@ namespace cso_gui
 						? normBones[i] : 0;
 					norms[i] = transformDirection(rawNorms[i], boneMatrices[static_cast<size_t>(bi)]);
 				}
+				// No normal table at all: keep the triangles with an up
+				// normal instead of dropping the whole submodel.
+				if (norms.empty())
+					norms.push_back({ 0.0f, 0.0f, 1.0f });
 
 				// Meshes.
 				if (numMesh > 0 && meshIndex > 0)
@@ -486,15 +554,31 @@ namespace cso_gui
 								std::memcpy(&s, base_ + cmdOff + 4, sizeof(s));
 								std::memcpy(&t, base_ + cmdOff + 6, sizeof(t));
 								cmdOff += 8;
-								if (v < 0 || v >= static_cast<int16_t>(verts.size()))
+								// Widen before comparing: casting a large
+								// vertex count down to int16_t wraps negative
+								// and would discard every triangle past 32767
+								// vertices.
+								if (v < 0 || static_cast<size_t>(v) >= verts.size())
 									continue;
-								if (norm < 0 || norm >= static_cast<int16_t>(norms.size()))
-									norm = 0;
+								// An out-of-range normal falls back to slot 0,
+								// or -1 when the submodel has no normals at
+								// all (makeTri skips those triangles: indexing
+								// norms[0] of an empty array would read
+								// unowned memory).
+								if (norm < 0 || static_cast<size_t>(norm) >= norms.size())
+									norm = norms.empty() ? -1 : 0;
 								vertsInStrip.push_back({ v, norm, static_cast<float>(s), static_cast<float>(t) });
 							}
 
 							auto makeTri = [&](const VertRef &a, const VertRef &b, const VertRef &c)
 							{
+								if (a.vert < 0 || static_cast<size_t>(a.vert) >= verts.size() ||
+									b.vert < 0 || static_cast<size_t>(b.vert) >= verts.size() ||
+									c.vert < 0 || static_cast<size_t>(c.vert) >= verts.size() ||
+									a.norm < 0 || static_cast<size_t>(a.norm) >= norms.size() ||
+									b.norm < 0 || static_cast<size_t>(b.norm) >= norms.size() ||
+									c.norm < 0 || static_cast<size_t>(c.norm) >= norms.size())
+									return;  // Corrupt strip: skip, don't index blindly.
 								Triangle tri;
 								tri.a = verts[static_cast<size_t>(a.vert)];
 								tri.b = verts[static_cast<size_t>(b.vert)];
@@ -512,18 +596,29 @@ namespace cso_gui
 								tri.normA = a.norm;
 								tri.normB = b.norm;
 								tri.normC = c.norm;
-								tri.boneA = (a.vert >= 0 && a.vert < static_cast<int16_t>(vertBones.size()))
-									? vertBones[static_cast<size_t>(a.vert)] : -1;
-								tri.boneB = (b.vert >= 0 && b.vert < static_cast<int16_t>(vertBones.size()))
-									? vertBones[static_cast<size_t>(b.vert)] : -1;
-								tri.boneC = (c.vert >= 0 && c.vert < static_cast<int16_t>(vertBones.size()))
-									? vertBones[static_cast<size_t>(c.vert)] : -1;
-								tri.normBoneA = (a.norm >= 0 && a.norm < static_cast<int16_t>(normBones.size()))
-									? normBones[static_cast<size_t>(a.norm)] : -1;
-								tri.normBoneB = (b.norm >= 0 && b.norm < static_cast<int16_t>(normBones.size()))
-									? normBones[static_cast<size_t>(b.norm)] : -1;
-								tri.normBoneC = (c.norm >= 0 && c.norm < static_cast<int16_t>(normBones.size()))
-									? normBones[static_cast<size_t>(c.norm)] : -1;
+								// Widen before comparing (same int16_t wrap
+								// issue as above); missing tables give -1,
+								// which ApplyFrame treats as "keep rest pose".
+								const auto boneFor = [&](int vert) -> int
+								{
+									if (vert < 0 ||
+										static_cast<size_t>(vert) >= vertBones.size())
+										return -1;
+									return vertBones[static_cast<size_t>(vert)];
+								};
+								const auto normBoneFor = [&](int norm) -> int
+								{
+									if (norm < 0 ||
+										static_cast<size_t>(norm) >= normBones.size())
+										return -1;
+									return normBones[static_cast<size_t>(norm)];
+								};
+								tri.boneA = boneFor(a.vert);
+								tri.boneB = boneFor(b.vert);
+								tri.boneC = boneFor(c.vert);
+								tri.normBoneA = normBoneFor(a.norm);
+								tri.normBoneB = normBoneFor(b.norm);
+								tri.normBoneC = normBoneFor(c.norm);
 								mesh.triangles.push_back(tri);
 							};
 
@@ -633,6 +728,8 @@ namespace cso_gui
 
 					// The stream is relative to this mstudioanim_t record.
 					const size_t streamStart = record + offset;
+					if (streamStart >= size_)
+						continue;  // No bytes available: static base pose.
 					// Walk the RLE span headers until numframes is covered.
 					size_t pos = streamStart;
 					int covered = 0;
@@ -647,7 +744,12 @@ namespace cso_gui
 						covered += total;
 						pos += 2 + static_cast<size_t>(valid) * 2;
 						if (!InRange(pos, 0, size_))
+						{
+							// Span claims bytes past EOF: keep only what is
+							// actually there instead of reading past the file.
+							pos = size_;
 							break;
+						}
 					}
 
 					AnimChannel &channel = boneAnim.channels[static_cast<size_t>(axis)];
@@ -826,6 +928,8 @@ namespace cso_gui
 				return base;
 			int k = 0;
 			const size_t pos = LocateSpan(channel, frame, k);
+			if (pos >= channel.size())
+				return base;  // Frame past the spans: hold the base pose.
 			const int valid = static_cast<int>(channel[pos]) & 0xFF;
 			const int total = (static_cast<int>(channel[pos]) >> 8) & 0xFF;
 
@@ -859,6 +963,8 @@ namespace cso_gui
 				return;
 			int k = 0;
 			const size_t pos = LocateSpan(channel, frame, k);
+			if (pos >= channel.size())
+				return;  // Frame past the spans: angles stay at base.
 			const int valid = static_cast<int>(channel[pos]) & 0xFF;
 			const int total = (static_cast<int>(channel[pos]) >> 8) & 0xFF;
 
