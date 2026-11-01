@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+﻿cmake_minimum_required(VERSION 3.21)
 project(cso_pak_tool LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -17,6 +17,10 @@ add_library(cso_pak_core STATIC
 	core/SnowCipher.cpp
 	core/CsoDecoder.h
 	core/CsoDecoder.cpp
+	core/NarArchive.h
+	core/NarArchive.cpp
+	core/NarBZip2.h
+	core/NarBZip2.cpp
 )
 target_include_directories(cso_pak_core PUBLIC core)
 
@@ -52,6 +56,10 @@ add_executable(cso-pak-gui WIN32
 	gui/src/TgaImage.cpp
 	gui/src/StudioModel.h
 	gui/src/StudioModel.cpp
+	gui/src/BspMap.h
+	gui/src/BspMap.cpp
+	gui/src/BspViewWidget.h
+	gui/src/BspViewWidget.cpp
 	gui/src/ModelViewWidget.h
 	gui/src/ModelViewWidget.cpp
 	gui/src/SpriteImage.h

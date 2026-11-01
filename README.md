@@ -1,39 +1,57 @@
 # CSO Pak Browser
 
 An Explorer-style GUI on top of the original `cso_pak` console tool: folder
-tree on the left, live preview (text / image / audio+video / CSV table / raw
-properties) on the right, plus pack/patch from the same File menu.
+tree on the left, live preview on the right, plus pack/patch from the same
+File menu. Besides `.pak` it reads Nexon `.nar` archives (where CSO keeps most
+models) and previews text, images (TGA/DDS/WAD textures), audio/video, CSV
+tables, `.mdl` models and `.spr` sprites in 3D/animated viewers, and whole
+`.bsp` maps with baked lighting, placed models/sprites and an optional skybox.
 
 ```
 project/
 ├── CMakeLists.txt
-├── core/                      ← original files; PakArchive.h/.cpp got a small API addition
-│   ├── Main.cpp                 (unchanged console tool, still builds as cso-pak-cli)
-│   ├── PakArchive.h/.cpp
-│   ├── SnowCipher.h/.cpp        (unchanged)
-│   └── CsoDecoder.h/.cpp        second-layer TEA decryption for .cso table entries
+├── CMakeUserPresets.json         points CMake at the local Qt install (see "Building")
+├── core/                         shared library `cso_pak_core` + the original console tool (11 files)
+│   ├── Main.cpp                    console tool (unpack/pack/patch), builds as cso-pak-cli
+│   ├── PakArchive.h/.cpp           .pak reader/writer; small API addition for the GUI
+│   ├── SnowCipher.h/.cpp           Snow cipher used by the pak format (unchanged)
+│   ├── CsoDecoder.h/.cpp           second-layer TEA decryption for .cso table entries
+│   ├── NarArchive.h/.cpp           Nexon .nar archive reader (directory + on-demand extraction)
+│   └── NarBZip2.h/.cpp             minimal bzip2 decoder for the .nar directory blob
 └── gui/
     ├── resources/
-    │   ├── app.rc                Windows resource script: exe icon + version/author info
-    │   └── cpb.ico                ← exe file icon
-    └── src/
-        ├── main.cpp              Qt application entry point
-        ├── MainWindow.h/.cpp     window layout, tree wiring, preview dispatch, extraction, pack/patch
-        ├── PakTreeModel.h/.cpp   QAbstractItemModel that turns entry paths into a folder tree
-        ├── TgaImage.h/.cpp       small standalone .tga decoder (Qt has no built-in TGA support)
-        ├── EucKrCodec.h/.cpp     Windows-only EUC-KR/CP949 (Korean) to UTF-8 decoding for .cso text
-        ├── StudioModel.h/.cpp    parser for GoldSource/CSO studiomdl (.mdl) files: bones, meshes,
-        │                          textures, skins, and sequence (animation) data
-        ├── ModelViewWidget.h/.cpp  QOpenGLWidget: renders a StudioModel with orbit/pan/zoom camera,
-        │                            bodygroup/skin selection, wireframe toggle, and sequence playback
-        ├── SpriteImage.h/.cpp    decoder for GoldSource/CSO .spr sprites (v2 palette-indexed,
-        │                          v3 embedded-DDS DXT5/DXT1/A8), flattened to a per-frame image list
-        ├── ByteCursor.h          shared bounds-checked little-endian reader (.spr, .dds, .wad)
-        ├── DxtDecompress.h/.cpp  shared DXT1/DXT3/DXT5 block decompression (.spr v3, .dds)
-        ├── DdsImage.h/.cpp       standalone .dds decoder: DXT1/DXT3/DXT5 plus common
-        │                          uncompressed RGB/RGBA/luminance layouts, mip level 0 only
-        └── Wad3Archive.h/.cpp    WAD2 (Quake)/WAD3 (Half-Life/GoldSource) archive parser plus a
-                                    miptex texture decoder, for .wad files found inside pak archives
+    │   ├── app.rc                  Windows resource script: exe icon + version/author info
+    │   └── cpb.ico                 exe file icon
+    └── src/                      Qt GUI (26 files)
+        ├── main.cpp                Qt application entry point
+        ├── MainWindow.h/.cpp       window layout, tree wiring, preview dispatch, extraction,
+        │                            pack/patch, and everything that feeds the viewers: texture/model
+        │                            resolution across archives, .wad lookup, BSP map assembly
+        │                            (placed models, sprites, skybox)
+        ├── PakTreeModel.h/.cpp     QAbstractItemModel that turns entry paths of every loaded
+        │                            .pak/.nar (and the lumps of .wad files) into one folder tree
+        ├── TgaImage.h/.cpp         small standalone .tga decoder (Qt has no built-in TGA support)
+        ├── EucKrCodec.h/.cpp       Windows-only EUC-KR/CP949 (Korean) to UTF-8 decoding for .cso text
+        ├── ByteCursor.h            shared bounds-checked little-endian reader (.spr, .dds, .wad, .bsp)
+        ├── DxtDecompress.h/.cpp    shared DXT1/DXT3/DXT5 block decompression (.spr v3, .dds)
+        ├── DdsImage.h/.cpp         standalone .dds decoder: DXT1/DXT3/DXT5 plus common
+        │                            uncompressed RGB/RGBA/luminance layouts, mip level 0 only
+        ├── Wad3Archive.h/.cpp      WAD2 (Quake)/WAD3 (Half-Life/GoldSource) archive parser plus a
+        │                            miptex texture decoder, for .wad files (inside archives or loose)
+        ├── SpriteImage.h/.cpp      decoder for GoldSource/CSO .spr sprites (v2 palette-indexed,
+        │                            v3 embedded-DDS DXT5/DXT1/A8), per-frame images, orientation
+        │                            type and frame origins (for placing sprites on maps)
+        ├── StudioModel.h/.cpp      parser for GoldSource/CSO studiomdl (.mdl) files: bones, meshes,
+        │                            textures, skins, bodyparts (with the `base` divisor used by the
+        │                            map "body" key) and sequence (animation) data
+        ├── ModelViewWidget.h/.cpp  QOpenGLWidget: renders a StudioModel with orbit / first-person
+        │                            camera, bodygroup/skin selection, wireframe, sequence playback
+        ├── BspMap.h/.cpp           GoldSrc BSP v30 parser (all lumps, textures, entities), brush-entity
+        │                            and placed-entity parsing, lightmap atlas builder, mesh builder
+        │                            (no OpenGL, usable headless) and the light-probe used for models
+        └── BspViewWidget.h/.cpp    QOpenGLWidget: renders a BSP map (lightmapped brushes, translucent /
+                                     additive passes, placed models, sprites, skybox) with orbit and
+                                     fly cameras
 ```
 
 ## What changed in the core files
@@ -65,19 +83,33 @@ straight from disk on demand. The public API is unchanged, but this is what
 lets the GUI keep hundreds of archives open at once without holding
 gigabytes of payload data in RAM.
 
+`NarArchive` / `NarBZip2` are new: Counter-Strike Online ships most models,
+sprites and textures in Nexon `.nar` archives (`Data/*.nar`) rather than in
+the `.pak` files. A `.nar` ends with an XOR-obfuscated, bzip2-compressed
+directory; `NarArchive::Load` decodes only that directory (via the built-in
+`NarBZip2` decoder, which verifies block CRCs) and `ExtractEntry` reads and
+decodes a single file on demand (raw, XOR-encoded, or XOR-encoded + LZSS
+compressed storage), so multi-gigabyte archives are never held in memory.
+Nar entries use the same `FoundEntry` abstraction in the GUI as pak entries,
+so every lookup (model textures, BSP-placed models, sprites, `.wad` files)
+searches both kinds.
+
 ## Building with Visual Studio 2022 + Qt6
 
 1. Install Qt6 via the Qt Online Installer, picking the **MSVC 2022 64-bit**
    component, and make sure **Qt Multimedia** is also checked (needed for the
    audio/video preview — `Qt Images`/image formats are optional but nice to
-   have too). OpenGL/OpenGLWidgets (used by the `.mdl` 3D viewer) ship as
-   part of the base Qt install, so there's nothing extra to check for that.
+   have too). OpenGL/OpenGLWidgets (used by the `.mdl` and `.bsp` 3D viewers)
+   ship as part of the base Qt install, so there's nothing extra to check
+   for that. The viewers need an OpenGL 3.3 core-capable driver.
 2. In Visual Studio 2022, make sure the **"Desktop development with C++"**
    workload is installed (gives you the built-in CMake support).
 3. `File → Open → Folder...` and pick the `project/` folder (the one with
    `CMakeLists.txt`).
 4. Point CMake at your Qt install with a `CMakeUserPresets.json` next to
-   `CMakeLists.txt`:
+   `CMakeLists.txt` (the snippet shows one preset; the project's file also
+   defines `relwithdebinfo` and `debug`, which are identical apart from
+   `CMAKE_BUILD_TYPE` and the output folder):
 
    ```json
    {
@@ -98,14 +130,84 @@ gigabytes of payload data in RAM.
 
    Adjust the Qt version/path to whatever you installed (forward slashes,
    no `inherits` — VS doesn't ship a `windows-default` preset for this
-   project to inherit from). Switch `CMAKE_BUILD_TYPE` to `Debug` if you
-   want debuggable binaries instead of a clean, deployable Release build.
+   project to inherit from). The presets are:
+
+   | preset | build type | output |
+   |---|---|---|
+   | `default` | Release | `out/build/default/` |
+   | `relwithdebinfo` | optimized + full PDB | `out/build/relwithdebinfo/` |
+   | `debug` | unoptimized, checks on | `out/build/debug/` |
+
+   Each preset has its own build folder, so they never overwrite each
+   other and you can switch back and forth freely.
 5. Build. Two targets come out: `cso-pak-cli.exe` (the original console
    tool, unchanged) and `cso-pak-gui.exe` (the browser).
 
+From a terminal (with the MSVC environment loaded, e.g. from an
+"x64 Native Tools" prompt, or after `call vcvars64.bat`):
+
+```bat
+cmake --preset relwithdebinfo
+cmake --build --preset relwithdebinfo
+```
+
+In Visual Studio, pick the preset from the configuration dropdown in the
+toolbar, then **Build → Build All**. To debug, select `cso-pak-gui.exe` as
+the startup item and press F5.
+
+<details>
+### Debug vs RelWithDebInfo
+
+- **RelWithDebInfo** = the Release build plus debug info (`/Zi`, linker
+  `/DEBUG`, plus `/Zo` for better stepping through optimized code). Speed
+  and behavior are almost identical to Release, so it is the best choice
+  for reproducing a crash that only happens in real use. The function name
+  and source line show up in the Visual Studio call stack as long as
+  `cso-pak-gui.pdb` sits next to `cso-pak-gui.exe` (build a matching pair
+  after every change — never mix an old PDB with a new EXE).
+- **Debug** = `/Od /RTC1 /MDd`. Besides no optimization, this switches on
+  the MSVC debug runtime, which gives you the "clear message" checks:
+  `_ITERATOR_DEBUG_LEVEL=2` (e.g. *"vector subscript out of range"*,
+  *"cannot dereference end vector iterator"*, *"iterator + offset out of
+  range"*), `assert()` failures, uninitialized-variable runtime checks
+  (`/RTC1`) and the debug heap (catches some double frees / use-after-free
+  patterns). Debug builds link against the debug Qt DLLs
+  (`Qt6Cored.dll`, ...), which this Qt installation ships, so they run
+  out of the box. Note that a Debug build changes timing and heap layout,
+  so a race-condition crash may not reproduce there — test both
+  configurations.
+
+### Catching the crash in the debugger
+
+- Start the app with **F5** from Visual Studio rather than double-clicking
+  the EXE; then the debugger is already attached when the fault happens.
+- **Debug → Windows → Exception Settings → Win32 Exceptions**: tick
+  *Access violation* (and *Stack overflow*). Without this, the process may
+  die before the debugger gets a chance to show the call stack.
+- If the crash comes from the standard library (`std::out_of_range`,
+  `std::length_error`, "vector subscript out of range"), a Debug build
+  stops right at the check with the message in the Output window. In
+  RelWithDebInfo those checks are disabled, but an access violation still
+  lands on the correct source line.
+- The `.pdb` must match the `.exe` exactly. Copy them together, and after
+  rebuilding always use the PDB from the same build folder.
+- If it only crashes outside the IDE, capture a dump (`procdump -e -ma
+  -w cso-pak-gui.exe`) and open the `.dmp` in Visual Studio; with the
+  matching EXE/PDB you get the same call stack and line numbers.
+
+Optional, for heap corruption that the debug CRT misses: MSVC has
+AddressSanitizer. Add it to a copy of the debug preset
+(`"CMAKE_CXX_FLAGS_DEBUG": "/Zi /Ob0 /Od /fsanitize=address"`), because
+ASan is incompatible with `/RTC1`; it prints a full allocation/free stack
+on the first bad access. It roughly halves performance and is only meant
+for hunting a specific bug.
+
 If you'd rather use qmake/Qt Creator instead of CMake, the same source files
 under `gui/src/` plus `core/` drop straight into a `.pro` file with
-`QT += widgets multimedia multimediawidgets` and `CONFIG += c++20`.
+`QT += widgets multimedia multimediawidgets opengl openglwidgets` and
+`CONFIG += c++20` (plus the system OpenGL library).
+
+</details>
 
 ## Getting a clean, deployable build (`install`)
 
@@ -130,17 +232,48 @@ whole step.
 
 ## Using the browser
 
-- **File → Open Pak...** loads a single `.pak` and populates the tree.
-- **File → Open Multiple Paks...** loads several `.pak` files at once;
-  **File → Open Pak Folder...** loads every `.pak` in a folder (e.g. the
-  game's whole `Data/Packer` directory — several hundred archives work
-  fine). All loaded archives appear as **one merged tree**: folders with
+- **File → Open Archive...** loads a single `.pak` or `.nar` file and shows
+  exactly its contents in the tree. Exception: opening a single `.pak` also
+  silently pulls in the neighbouring `.nar` archives (same folder and its
+  parent — CSO keeps most models there, next to `Packer/`), because model
+  textures and BSP-placed models usually live in `.nar`, not in the `.pak`
+  itself. Those auto-loaded `.nar` files stay hidden from the tree (see
+  `View` below) but are fully used for resolution — a single `.nar` on its
+  own loads exactly, with no additions.
+- **File → Open Multiple Archives...** loads several `.pak` and/or `.nar`
+  files as one merged tree — free choice, exactly what was selected, no
+  silent additions. Picking only `.pak` files here shows only their contents
+  (models whose files live in `.nar` will then report missing files).
+- **File → Open Paks + All Nars...** — pick `.pak` files, and every
+  neighbouring `.nar` is pulled in automatically **and shown**: the one-click
+  setup for BSP maps, whose placed models (cars, trees, fences, …) almost
+  all live in `.nar`.
+- **File → Open Archives Folder...** loads every `.pak`/`.nar` in a folder
+  (e.g. the game's whole `Data/Packer` directory — several hundred archives
+  work fine), plus the parent folder's `.nar` files when the folder itself
+  has none.
+- **View → Show auto-loaded NAR archives** (checkbox, remembered across
+  restarts): shows the silently pulled-in `.nar` files in the tree, or hides
+  them again. Hiding only affects the tree — texture/model/WAD resolution
+  always searches every loaded archive either way, so opening one `.pak`
+  keeps resolving its models' textures from the hidden `.nar` files.
+- **View → Find File...** (Ctrl+F, or the search box in the toolbar) searches
+  the full internal path of every entry in every loaded `.pak` **and** `.nar`
+  archive — including auto-loaded `.nar` files that the option above hides
+  from the tree. Matching is case-insensitive; `*` and `?` work as wildcards.
+  Results appear in a dock at the bottom with **Name / Path / Archive / Type**
+  columns, so the same file name found in several archives is shown once per
+  archive (with the archive that holds it). Selecting a row previews that
+  concrete file; double-clicking reveals it in the archive tree when the
+  archive is shown there. This is the quick way to answer "which archive
+  contains `v_xxx.mdl`?" without expanding hundreds of folders by hand.
+- All loaded archives appear as **one merged tree**: folders with
   the same virtual path are combined, and files with the same virtual path
   from different archives are all shown side by side — no duplicate is
   hidden and no "newest pak wins" rule is applied, since game updates
   scatter newer copies of files across archives unpredictably. Use the
   tooltip (hover) or the status bar (click a file) to see which concrete
-  `.pak` a given entry came from: `lstrike/.../v_usp.mdl — common_00137.pak`.
+  archive a given entry came from: `lstrike/.../v_usp.mdl — common_00137.pak`.
   Loading shows a progress dialog with Cancel; archives that fail to parse
   are reported in a list at the end instead of aborting the whole batch.
   Only each archive's entry table is kept in memory — file bytes are read
@@ -192,7 +325,8 @@ whole step.
     Windows, the decrypted bytes are checked for EUC-KR/CP949 (Korean)
     content first and converted to UTF-8 if so — these table files are the
     game's own data, and mixed Korean comments are common in them.
-  - `.txt` and other recognized text extensions, or anything that "looks like
+  - `.txt` and other recognized text extensions (`txt ini cfg log xml json lst
+    def vdf inf`), or anything that "looks like
     text" by a byte-content heuristic → shown in a monospace text view.
     Decoding is BOM-aware (UTF-8/UTF-16LE/UTF-16BE/UTF-32 are all detected
     from the file's byte-order mark and decoded correctly — several of the
@@ -238,9 +372,10 @@ whole step.
     the shader). Additive rendering (fire, glow, particle FX — a solid
     black plane on a weapon or boss is almost always one of these) is
     detected two ways: the file's own `additive` flag, or the texture name
-    starting with `$0a_`/`$0b_` — an undocumented CSO naming convention
-    confirmed by hand across ~20 models where the flag isn't set but the
-    black background is still meant to be transparent. Either way, it gets
+    starting with `$0a_`/`$0b_`/`ef_` — undocumented CSO naming conventions
+    confirmed by hand across many models where the flag isn't set but the
+    black background is still meant to be transparent (`ef_` = effect
+    textures such as `ef_sewerhole*`). Either way, it gets
     a real second render pass: drawn blended (`GL_ONE`, so it adds light
     instead of alpha-compositing), unlit (its own texture color/brightness,
     not modulated by the scene lighting above — self-illumination isn't
@@ -253,6 +388,11 @@ whole step.
     applies) and lets you force either direction by hand per texture. It's
     per-model (cleared when you load a different .mdl, since texture
     indices aren't comparable across files).
+    The **Camera** box offers *Orbit* and *First person* (view-model
+    framing with an adjustable FOV, for weapon `v_` models). Right-click
+    a texture entry → **Export texture...** saves it as BMP/PNG/JPEG.
+    Textureless world models (`w_xxx_big.mdl`) automatically take their
+    textures from the twin `w_xxx_bigt.mdl` texture file.
     Some models only *name* a texture (CSO's own convention: a `#`-prefixed
     name, or a tiny placeholder image like 4×1) and ship the real pixels as
     a separate loose file elsewhere in the same pak — the tool searches
@@ -278,6 +418,114 @@ whole step.
     long one. `Fit to window` defaults to *off* here (unlike the plain
     image preview) since sprites are usually small icons that look bad
     stretched up to fill the window.
+  - `.bsp` (GoldSrc BSP v30 maps) → an interactive 3D map viewer
+    (`BspViewWidget`). Left-drag looks/orbits, right-drag pans (orbit mode),
+    wheel zooms. The side panel has a camera selector — **Orbit** or **Fly
+    (WASD)** (WASD/Q/E/C/Space/Shift work on any keyboard layout, because
+    they are matched by scan code) — plus *Reset View*, *Map brightness*,
+    *Model light boost*, *FOV*, *Wireframe* and *Pulse (renderfx)* (pulsing
+    brightness of glowing signs, off by default), and a summary of faces,
+    models, entities, texture sources, used/missing `.wad` files and placed
+    models/sprites. Several viewer options live in the **View** menu (all
+    apply to the BSP viewer only):
+    - **Show skybox in BSP viewer** — sky on/off (off by default: the sky
+      faces enclose parts of the level and hide it when viewed from outside).
+    - **Hide map parts and models outside the PVS (as in game)** — off by
+      default. Draws world faces, placed models, sprites and brush entities
+      only when the game would send them to a player standing at the camera
+      (their leaf is in the camera leaf's PVS). Works with the fly camera
+      inside the map; with the camera outside everything stays visible. While
+      it is on, a permanent status-bar line shows the camera position, its
+      leaves and how many entities/sprites are drawn.
+    - **Cull back faces in BSP viewer (as in game)** — on by default, as the
+      engine draws brush faces from their front side only. Turn it off to see
+      both sides (useful for one-sided faces that look wrongly missing).
+    - **Apply env_fog in BSP viewer (as in game)** — off by default. Maps with
+      an `env_fog` entity fade distant geometry into the fog colour
+      (exponential-squared fog, like the engine); no effect on maps without
+      one.
+    - **Show map state after the scripted switch (cutscene, destroyed props)**
+      — off by default. CSO maps swap some models with a trigger
+      (`cycler_mdl` `_mdl0` → `_mdl1`, `env_render` "..._on" targets, etc.:
+      intact antennas become burnt ones, a hidden boss appears). Off shows the
+      map as it is at round start; on shows it after the switch. Toggling it
+      reloads the map (the camera resets).
+    - *Textures* come from the BSP itself, from the `.wad` files the map
+      names (searched in every loaded archive, in the texture folders, and
+      in neighbouring `.pak` files; wads that are still missing textures
+      are searched for the remaining names), or from loose files. Textures
+      starting with `{` are cut-outs (palette index 255 transparent). As in
+      the engine, the transparent texels are only cut out on brush entities
+      with rendermode Solid/Texture/Glow/Additive and on models and sprites;
+      worldspawn faces and Normal/Color-mode brush entities draw them opaque
+      black. Their mip levels are rebuilt the way the `.wad` stores them
+      (binary alpha), so far-away fences and wires keep their thickness.
+      Liquid (`!`) faces are drawn only from the side facing the eye.
+      Editor/tool textures (`null`, `clip`, `aaatrigger`, `hint`, `skip`,
+      `origin`, CSO's blue `nowallshot` marker, ...) are not drawn.
+    - *Transparent edges*: alpha-tested images (`{` textures, model textures
+      and `.spr` sprites with the "alpha test" format) keep their blue
+      transparency key colour (0,0,255) in the RGB of the masked texels.
+      Before upload to the GPU the viewer fills those texels with the colour
+      of the nearest opaque ones (`BleedTransparentColors`), so bilinear
+      filtering and mipmaps no longer draw a blue fringe around grass
+      blades, leaves or fences.
+    - *Lighting* uses the map's baked lightmaps (packed into one atlas;
+      faces without a lightmap stay fullbright). All stored light styles of
+      a face are treated as active and summed (clamped to 255); style
+      animation/switching is not simulated. The default **game-fitted** model
+      is calibrated against in-game screenshots; **Map brightness** scales
+      it and **Model light boost** blends placed models between "lit exactly
+      like the map under them" and the game-fitted ambient band. (A second,
+      "Plain (like goldsrc-bsp-viewer)" shader mode still exists but its
+      switch is hidden — set `kShowLightingModeSwitch` to `true` in
+      `MainWindow.cpp` to bring it back; the boost slider reproduces it.)
+      Maps lit by a very strong sun (e.g.
+      `zs_evacuate3`, `zs_electron2`) store sun-facing surfaces clipped at
+      255, so for those maps (detected automatically from the lightmap
+      histogram) the brightest values are compressed by a smooth, monotonic
+      roll-off — the constants `kKneeStart/kKneeLen/kKneeSlope` in
+      `BspViewWidget.cpp` tune it. Placed models are lit like the engine
+      does: the lightmap texel under the model supplies the light's hue, the
+      brightness stays in a compressed ambient band (`Model light boost`),
+      CSO's `renderfx 22` + `rendercolor` light multiplier is honoured, and
+      a model with no lit floor beneath it gets only its minimum ambient.
+    - *Brush entities* (doors, glass, glow arrows, signs, ...) follow
+      their `rendermode`/`renderamt`/`rendercolor`: colour tint, alpha blend
+      (translucent faces are sorted back to front like the engine does) and
+      additive glow/beam rendering. As in the engine, an entity with a
+      non-normal rendermode and no `renderamt` is invisible (used for
+      invisible blockers), `func_rotating`-type brushes are positioned from
+      their origin, brush-entity faces are drawn from their front side only
+      and depth-biased so they don't z-fight with coplanar world faces.
+      Some entities are animated: spinning pictograms (`func_rotating` signs
+      such as the "E" prompts) turn at the entity's `speed`, and the
+      **Pulse (renderfx)** checkbox modulates translucent/additive signs with
+      `renderfx` 1-4. CSO's `renderfx 24` coloured glow shell (pushable boxes
+      green, breakable boxes red) and crossed-plane marker brushes (drawn as
+      camera-facing quads) are handled too. `func_train` brushes are drawn
+      where the mapper placed them or at their first `path_corner`, and
+      `func_wall_toggle`/`env_render` targets follow the "map state after the
+      scripted switch" option above. There is still no other entity logic —
+      doors and lifts are drawn where they are stored.
+    - *Placed props*: every `.mdl` named by a point entity (`cycler_mdl`,
+      supply boxes, weapon boxes via `packmdl`, trees, vehicles, ...) is
+      found in the loaded `.pak`/`.nar` archives and baked into the scene
+      with the entity's origin/angles/scale, `skin`, `body` (submodel per
+      bodypart) and `sequence` (default 0), including chrome textures and
+      additive effect textures. `.spr` entities (`env_sprite`, ...) are drawn
+      as billboards honouring the sprite's orientation type, frame origin
+      and render mode (first frame only). Sprites in Normal/Texture mode (grass,
+      bushes) are lit by the lightmap texel under the entity, like placed
+      models; additive/glow sprites stay self-luminous. Special cases: `cycler_mdl`
+      model switchers (`_mdl0`/`_mdl1`), `models/null.mdl` (= not shown),
+      `hostage_entity` (dropped to the floor like the engine does),
+      `naval_weapon`, and trains with `model_ex` and no origin (placed at
+      their first `path_corner`). Use **File → Open Paks + All Nars...** for maps:
+      their models almost all live in `.nar`.
+    - *Skybox*: the map's `skyname` is resolved to the six `gfx/env/<sky>*`
+      images in the archives, and the map's own `sky` faces show it exactly
+      like the engine does (direction from the eye).
   - Everything else (compressed entries, unrecognized binary formats) → a
     properties panel with path, sizes, type flags, base key, checksum.
 - **File → Extract All...** — same as the console tool's `unpack` command
@@ -302,15 +550,30 @@ whole step.
 
 ## Known limitations
 
+- BSP viewer: all stored light styles are simply summed, so there are no
+  switchable/animated lights and no dynamic lights; there are no animated
+  textures and water is a plain (non-waving) texture; PVS culling is
+  optional (View menu, off by default) and only the map's leaf-level
+  visibility is used, no portals/areas. Entity logic is limited to what is
+  listed above — doors, lifts and the like are drawn where they are
+  stored. Placed `.mdl` models are static (rest pose or frame 0 of the entity's
+  `sequence`) and placed sprites show only their first frame. The light
+  calibration is empirical (CSO's exact curve is unknown), so brightness can
+  differ a little from the game; the tuning constants are named and
+  commented in the shader.
+- A map's skybox only shows if its images are found in the loaded archives.
+
 - Compressed entries (`type & Compressed`) can't be previewed or extracted —
   that was already true of `UnpackToDirectory`; `ExtractEntry` just surfaces
   it as a message instead of a crash.
-- Individual lumps inside a `.wad` can be previewed but not extracted to a
-  file on their own — "Extract Selected" only knows how to pull a real,
-  top-level pak entry out via `PakArchive::ExtractEntry`, and a WAD lump
-  isn't one (it's nested inside the `.wad`'s own bytes). Selecting/extracting
-  the `.wad` file itself works normally and gets you the whole thing,
-  lumps included; picking them apart from there needs a separate tool.
+- Individual lumps inside a `.wad` can be previewed and saved as images, but
+  not extracted as raw lumps: right-click one lump → **Save Texture As
+  Image...** (PNG/BMP/JPEG) or several → **Save N Textures As PNG...**
+  (to a folder; PNG keeps the transparency of `{` cut-outs). "Extract
+  Selected" only knows how to pull a real, top-level pak/nar entry out, and
+  a WAD lump isn't one (it's nested inside the `.wad`'s own bytes).
+  Extracting the `.wad` file itself works normally and gets you the whole
+  thing, lumps included.
 - Text without a BOM falls back to UTF-8, then Latin-1, if neither decodes
   cleanly. If some of your archives turn out to be Windows-1251 (or another
   8-bit code page) *without* a BOM, add the optional **Qt6 Core5Compat**
@@ -345,5 +608,5 @@ whole step.
   paranoia: `QOpenGLWidget`'s own internal compositing (blitting its
   rendered frame into the rest of the window) does its own GL work between
   your `paintGL` calls and can leave blend state on afterward — confirmed
-  directly in this environment (forcing a second frame of the same model
-  showed `GL_BLEND` already enabled on entry, before the reset ran).
+  directly (forcing a second frame of the same model showed `GL_BLEND`
+  already enabled on entry, before the reset ran).

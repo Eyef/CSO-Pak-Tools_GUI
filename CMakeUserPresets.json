@@ -9,6 +9,37 @@
         "CMAKE_PREFIX_PATH": "F:/Qt/6.11.1/msvc2022_64",
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (no optimization, vector/iterator checks on)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/debug",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "F:/Qt/6.11.1/msvc2022_64",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo (optimized + full PDB, /Zo)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "F:/Qt/6.11.1/msvc2022_64",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "/Zi /O2 /Ob1 /DNDEBUG /Zo"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo"
     }
   ]
 }
