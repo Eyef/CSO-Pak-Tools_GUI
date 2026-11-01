@@ -156,6 +156,7 @@ toolbar, then **Build → Build All**. To debug, select `cso-pak-gui.exe` as
 the startup item and press F5.
 
 <details>
+    
 ### Debug vs RelWithDebInfo
 
 - **RelWithDebInfo** = the Release build plus debug info (`/Zi`, linker
