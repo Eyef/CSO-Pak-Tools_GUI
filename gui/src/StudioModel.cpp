@@ -2,15 +2,19 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+
+#include "ModelCrypt.h"
 
 namespace cso_gui
 {
 	namespace
 	{
 		constexpr int kStudioHeaderId = 0x54534449;  // "IDST" little-endian
+		constexpr int kStudioVersionDecrypted = 9;  // ICE model after decryption
 		constexpr int kStudioVersion10 = 10;
 		constexpr int kStudioVersion11 = 11;
 
@@ -101,6 +105,7 @@ namespace cso_gui
 	{
 		valid_ = false;
 		version_ = 0;
+		encrypted_ = false;
 		name_.clear();
 		bones_.clear();
 		bodyParts_.clear();
@@ -113,10 +118,27 @@ namespace cso_gui
 		if (data.size() < 244)
 			throw std::runtime_error("model: file too small to be a studio model");
 
-		base_ = data.data();
-		size_ = data.size();
-		// base_/size_ point into the caller's buffer: reset them on every
-		// exit path, including exceptions from the Parse* steps.
+		// ICE-encrypted CSO models (header version 20/21) keep their texture
+		// pixels and vertex arrays encrypted. Decrypt a private copy so the
+		// caller's bytes stay untouched; `decrypted` is declared before the
+		// guard below, so it outlives every use of base_.
+		std::vector<uint8_t> decrypted;
+		const std::vector<uint8_t> *bytes = &data;
+		const int encryptedVersion = cso_pak::ModelCrypt::EncryptedVersion(data);
+		if (encryptedVersion != 0)
+		{
+			decrypted = data;
+			if (cso_pak::ModelCrypt::Decrypt(decrypted) != cso_pak::ModelCrypt::Result::Success)
+				throw std::runtime_error("model: cannot decrypt ICE-encrypted model (version " +
+					std::to_string(encryptedVersion) + ")");
+			bytes = &decrypted;
+			encrypted_ = true;
+		}
+
+		base_ = bytes->data();
+		size_ = bytes->size();
+		// base_/size_ point into the caller's buffer (or `decrypted`): reset
+		// them on every exit path, including exceptions from the Parse* steps.
 		struct BaseGuard
 		{
 			StudioModel &model;
@@ -127,8 +149,13 @@ namespace cso_gui
 			throw std::runtime_error("model: not a studio model (bad IDST magic)");
 
 		version_ = Int(kOffVersion);
-		if (version_ != kStudioVersion10 && version_ != kStudioVersion11)
+		// 9 is what the decrypted form of an ICE model carries (see
+		// ModelCrypt); same layout as 10 for everything parsed here.
+		if (version_ != kStudioVersionDecrypted && version_ != kStudioVersion10 &&
+			version_ != kStudioVersion11)
 			throw std::runtime_error("model: unsupported studio version " + std::to_string(version_));
+		if (encrypted_)
+			version_ = encryptedVersion;  // report what is on disk (20/21)
 
 		name_ = ReadFixedString(Ptr(kOffName), 64);
 
@@ -687,23 +714,30 @@ namespace cso_gui
 		// Decode each sequence's animation keyframes into usable form.
 		decodedSequences_.resize(sequences_.size());
 		for (size_t i = 0; i < sequences_.size(); ++i)
-			DecodeSequenceAnimation(i);
+			DecodeSequenceAnimation(i, base_, size_, 0);
 	}
 
-	void StudioModel::DecodeSequenceAnimation(size_t sequenceIndex)
+	void StudioModel::DecodeSequenceAnimation(size_t sequenceIndex, const uint8_t *data,
+		size_t size, std::int64_t bias)
 	{
 		DecodedSequence &decoded = decodedSequences_[sequenceIndex];
 		const Sequence &seq = sequences_[sequenceIndex];
 		if (seq.numblends <= 0 || seq.numframes <= 0 || bones_.empty() ||
-			seq.animindex <= 0)
+			seq.animindex <= 0 || data == nullptr)
+			return;
+
+		// animindex is an address in the original model; `bias` maps it onto
+		// `data` (0 when `data` is the .mdl itself).
+		const std::int64_t localAnimIndex = static_cast<std::int64_t>(seq.animindex) - bias;
+		if (localAnimIndex < 0)
 			return;
 
 		// mstudioanim_t: 6 x uint16 offsets (12 bytes), ordered [blend][bone].
 		const size_t animStride = 12;
 		const size_t totalAnims =
 			static_cast<size_t>(seq.numblends) * bones_.size();
-		if (!InRange(static_cast<size_t>(seq.animindex),
-			animStride * totalAnims, size_))
+		if (!InRange(static_cast<size_t>(localAnimIndex),
+			animStride * totalAnims, size))
 			return;
 
 		decoded.blends.resize(static_cast<size_t>(seq.numblends));
@@ -714,40 +748,40 @@ namespace cso_gui
 			blendAnims.resize(bones_.size());
 			for (size_t bone = 0; bone < bones_.size(); ++bone)
 			{
-				const size_t record = static_cast<size_t>(seq.animindex) +
+				const size_t record = static_cast<size_t>(localAnimIndex) +
 					(static_cast<size_t>(blend) * bones_.size() + bone) * animStride;
 
 				BoneAnim &boneAnim = blendAnims[bone];
 				for (int axis = 0; axis < 6; ++axis)
 				{
 					std::uint16_t offset;
-					std::memcpy(&offset, base_ + record + static_cast<size_t>(axis) * 2,
+					std::memcpy(&offset, data + record + static_cast<size_t>(axis) * 2,
 						sizeof(offset));
 					if (offset == 0)
 						continue;
 
 					// The stream is relative to this mstudioanim_t record.
 					const size_t streamStart = record + offset;
-					if (streamStart >= size_)
+					if (streamStart >= size)
 						continue;  // No bytes available: static base pose.
 					// Walk the RLE span headers until numframes is covered.
 					size_t pos = streamStart;
 					int covered = 0;
-					while (covered < seq.numframes && pos < size_)
+					while (covered < seq.numframes && pos < size)
 					{
-						if (!InRange(pos, 2, size_))
+						if (!InRange(pos, 2, size))
 							break;
-						const std::uint8_t valid = base_[pos];
-						const std::uint8_t total = base_[pos + 1];
+						const std::uint8_t valid = data[pos];
+						const std::uint8_t total = data[pos + 1];
 						if (total == 0)
 							break;  // malformed
 						covered += total;
 						pos += 2 + static_cast<size_t>(valid) * 2;
-						if (!InRange(pos, 0, size_))
+						if (!InRange(pos, 0, size))
 						{
 							// Span claims bytes past EOF: keep only what is
 							// actually there instead of reading past the file.
-							pos = size_;
+							pos = size;
 							break;
 						}
 					}
@@ -758,12 +792,285 @@ namespace cso_gui
 					for (size_t k = 0; k < count; ++k)
 					{
 						std::int16_t value;
-						std::memcpy(&value, base_ + streamStart + k * 2, sizeof(value));
+						std::memcpy(&value, data + streamStart + k * 2, sizeof(value));
 						channel[k] = value;
 					}
 				}
 			}
 		}
+	}
+
+	int StudioModel::AppendExternalSequences(const std::vector<uint8_t> &seqData, int groupNumber)
+	{
+		// Same bone layout as the model the file belongs to, so without
+		// bones there is nothing the animations could drive.
+		if (!valid_ || bones_.empty())
+			return 0;
+
+		constexpr size_t kSeqDescStride = 176;  // mstudioseqdesc_t, see ParseSequences
+		constexpr size_t kFileHeaderBytes = 8;  // int32 numseq, int32 seqdescOffset
+		constexpr int kMaxSequencesPerFile = 4096;
+		// Fallback only (see the detection after decoding): files from this
+		// group on normally use radians * 10240 instead of the .mdl's per-bone
+		// scale.
+		constexpr int kFirstUniformScaleGroup = 3;
+
+		const uint8_t *data = seqData.data();
+		const size_t size = seqData.size();
+		if (size < kFileHeaderBytes + kSeqDescStride)
+			throw std::runtime_error("seq: file too small");
+
+		const auto readInt = [&](size_t offset) -> int32_t
+		{
+			int32_t value;
+			std::memcpy(&value, data + offset, sizeof(value));
+			return value;
+		};
+		const auto readFloat = [&](size_t offset) -> float
+		{
+			float value;
+			std::memcpy(&value, data + offset, sizeof(value));
+			return value;
+		};
+
+		const int32_t count = readInt(0);
+		const int32_t tableOffset = readInt(4);
+		if (count <= 0 || count > kMaxSequencesPerFile ||
+			tableOffset < static_cast<int32_t>(kFileHeaderBytes) ||
+			!InRange(static_cast<size_t>(tableOffset),
+				kSeqDescStride * static_cast<size_t>(count), size))
+			throw std::runtime_error("seq: bad header or sequence table out of range");
+
+		// Parse everything first so a malformed file leaves the model untouched.
+		std::vector<Sequence> parsed;
+		parsed.reserve(static_cast<size_t>(count));
+		// Lowest address any sequence data (events, pivots, animations) refers
+		// to. That data starts right after the 8-byte file header, which
+		// anchors the pointer -> file offset translation.
+		std::int64_t lowestPointer = std::numeric_limits<std::int64_t>::max();
+		const auto noteStart = [&](int count_, int index)
+		{
+			if (count_ > 0 && index > 0)
+				lowestPointer = std::min<std::int64_t>(lowestPointer, index);
+		};
+		for (int32_t i = 0; i < count; ++i)
+		{
+			const size_t off = static_cast<size_t>(tableOffset) + static_cast<size_t>(i) * kSeqDescStride;
+			Sequence seq;
+			seq.label = ReadFixedString(data + off, kMaxSequenceLabel);
+			seq.fps = readFloat(off + 32);
+			seq.numframes = readInt(off + 56);
+			seq.numblends = std::max(readInt(off + 120), 0);
+			seq.animindex = readInt(off + 124);
+			seq.motiontype = readInt(off + 68);
+			seq.motionbone = readInt(off + 72);
+			seq.externalGroup = groupNumber;
+			// Provisional guess; replaced below by looking at the data itself.
+			seq.uniformRotationScale = groupNumber >= kFirstUniformScaleGroup;
+
+			noteStart(readInt(off + 48), readInt(off + 52));  // numevents, eventindex
+			noteStart(readInt(off + 60), readInt(off + 64));  // numpivots, pivotindex
+			noteStart(seq.numblends, seq.animindex);
+			parsed.push_back(std::move(seq));
+		}
+
+		const std::int64_t bias =
+			lowestPointer == std::numeric_limits<std::int64_t>::max()
+				? 0
+				: lowestPointer - static_cast<std::int64_t>(kFileHeaderBytes);
+
+		// The animation values of a sequence follow its record table
+		// (numblends * numbones * 12 bytes) directly. If they do not, the
+		// file was made for a different skeleton -- e.g. "foo1.seq" of a
+		// model "foo1.mdl" sitting next to "foo.mdl" -- and applying it
+		// would just tear the model apart. Check the first sequence that
+		// has any animation data and reject the whole file on a mismatch.
+		for (const Sequence &seq : parsed)
+		{
+			if (seq.numblends <= 0 || seq.numframes <= 0 || seq.animindex <= 0)
+				continue;
+			const std::int64_t local = static_cast<std::int64_t>(seq.animindex) - bias;
+			const size_t recordBytes =
+				static_cast<size_t>(seq.numblends) * bones_.size() * 12;
+			if (local < static_cast<std::int64_t>(kFileHeaderBytes) ||
+				!InRange(static_cast<size_t>(local), recordBytes, size))
+				throw std::runtime_error(
+					"seq: animation table out of range (different skeleton?)");
+			size_t lowestStream = std::numeric_limits<size_t>::max();
+			for (size_t r = 0; r < recordBytes / 12; ++r)
+			{
+				const size_t record = static_cast<size_t>(local) + r * 12;
+				for (size_t axis = 0; axis < 6; ++axis)
+				{
+					std::uint16_t offset;
+					std::memcpy(&offset, data + record + axis * 2, sizeof(offset));
+					if (offset != 0)
+						lowestStream = std::min(lowestStream, record + offset);
+				}
+			}
+			if (lowestStream == std::numeric_limits<size_t>::max())
+				continue;  // static pose only, says nothing about the skeleton
+			if (lowestStream != static_cast<size_t>(local) + recordBytes)
+				throw std::runtime_error(
+					"seq: animation layout does not match this model's skeleton");
+			break;
+		}
+
+		const size_t firstNew = sequences_.size();
+		decodedSequences_.resize(sequences_.size());
+		for (auto &seq : parsed)
+			sequences_.push_back(std::move(seq));
+		decodedSequences_.resize(sequences_.size());
+		for (size_t i = firstNew; i < sequences_.size(); ++i)
+			DecodeSequenceAnimation(i, data, size, bias);
+
+		// Which rotation encoding does this file use? Two exist:
+		//  * the .mdl's per-bone-axis scale (mstudiobone_t::scale[3..5]): the
+		//    compiler normalises every axis so that its largest value reaches
+		//    +-32767, and
+		//  * radians * 10240 for every bone and axis (the delta from the rest
+		//    angle, wrapped to +-pi, so values never exceed pi * 10240 =
+		//    32170).
+		// The two ranges do not overlap, so the largest rotation value in the
+		// file decides it: all 316 .mdl-scaled files of the checked corpora
+		// reach 32760..32768, while all 902 radians * 10240 files stay within
+		// +-32169. Neither the group number (a group-2 file such as the -shop
+		// "shop_violin_*" poses is already radians * 10240) nor a comparison
+		// with 32767 * scale[axis] is reliable: the .mdl's scales describe
+		// its own compiled animations, and separately exported .seq files may
+		// legitimately exceed them, so that test misread about half of the
+		// nar-archive models whose animations come from a different compile.
+		{
+			constexpr int kBeyondUniformRange = 32200;  // pi * 10240 = 32170
+			constexpr size_t kMinChannels = 20;         // fewer: not enough evidence
+			int maxAbs = 0;
+			size_t channels = 0;
+			for (size_t i = firstNew; i < sequences_.size(); ++i)
+				for (const auto &blend : decodedSequences_[i].blends)
+					for (size_t bone = 0; bone < blend.size() && bone < bones_.size(); ++bone)
+						for (size_t axis = 3; axis < 6; ++axis)
+						{
+							const AnimChannel &ch = blend[bone].channels[axis];
+							size_t pos = 0;
+							int peak = 0;
+							while (pos < ch.size())
+							{
+								const size_t valid = static_cast<size_t>(ch[pos]) & 0xFF;
+								for (size_t k = 1; k <= valid && pos + k < ch.size(); ++k)
+									peak = std::max(peak, std::abs(static_cast<int>(ch[pos + k])));
+								pos += 1 + valid;
+							}
+							if (peak == 0)
+								continue;
+							maxAbs = std::max(maxAbs, peak);
+							++channels;
+						}
+			bool uniform = groupNumber >= kFirstUniformScaleGroup;  // too little data
+			if (maxAbs > kBeyondUniformRange)
+				uniform = false;
+			else if (channels >= kMinChannels)
+				uniform = true;
+			for (size_t i = firstNew; i < sequences_.size(); ++i)
+				sequences_[i].uniformRotationScale = uniform;
+
+			// Some shop scenes stack a second, unrelated skeleton into the
+			// same .mdl (the shopkeeper plus a passer-by). Those files are
+			// radians * 10240 as a whole, but the spare skeleton's static
+			// channels are only meaningful with the .mdl's own scales: read as
+			// radians, every limb turns by ~pi and the figure folds into a
+			// shapeless mass (criss-shop: the second character below the
+			// scene). Spot such a branch and keep the .mdl scales there while
+			// the main skeleton still uses radians * 10240.
+			if (uniform)
+			{
+				constexpr float kImpossibleAngle = 2.5f;  // ~143 deg in radians
+				constexpr float kSaneAngle = 0.9f;        // ~52 deg in radians
+				std::vector<std::uint8_t> mark(bones_.size(), 0);
+				for (size_t s = firstNew; s < sequences_.size(); ++s)
+				{
+					if (decodedSequences_[s].blends.empty())
+						continue;
+					const std::vector<BoneAnim> &blend =
+						decodedSequences_[s].blends.front();
+					std::fill(mark.begin(), mark.end(), std::uint8_t{ 0 });
+					bool any = false;
+					for (size_t b = 0; b < blend.size() && b < bones_.size(); ++b)
+					{
+						const float rest[3] = {
+							bones_[b].rotation.x, bones_[b].rotation.y,
+							bones_[b].rotation.z };
+						bool hasData = false;
+						bool constant = true;
+						float uniformMax = 0.0f;
+						float mdlMax = 0.0f;
+						for (size_t axis = 3; axis < 6; ++axis)
+						{
+							const AnimChannel &ch = blend[b].channels[axis];
+							size_t pos = 0;
+							int value = 0;
+							bool haveValue = false;
+							while (pos < ch.size())
+							{
+								const size_t valid =
+									static_cast<size_t>(ch[pos]) & 0xFF;
+								for (size_t k = 1; k <= valid && pos + k < ch.size(); ++k)
+								{
+									const int v = static_cast<int>(ch[pos + k]);
+									if (!haveValue)
+									{
+										value = v;
+										haveValue = true;
+									}
+									else if (v != value)
+									{
+										constant = false;
+									}
+								}
+								pos += 1 + valid;
+							}
+							if (!haveValue)
+								continue;
+							if (value != 0)
+								hasData = true;
+							uniformMax = std::max(uniformMax,
+								std::abs(rest[axis - 3] +
+									static_cast<float>(value) / 10240.0f));
+							mdlMax = std::max(mdlMax,
+								std::abs(rest[axis - 3] +
+									static_cast<float>(value) * bones_[b].scale[axis]));
+						}
+						if (!hasData || !constant)
+							continue;
+						if (uniformMax >= kImpossibleAngle && mdlMax <= kSaneAngle &&
+							uniformMax > 2.5f * mdlMax)
+						{
+							mark[b] = 1;
+							any = true;
+						}
+					}
+					if (!any)
+						continue;
+					// The whole branch shares one rig: switching only the bone
+					// that tripped the check would leave the trunk twisted.
+					for (bool changed = true; changed;)
+					{
+						changed = false;
+						for (size_t b = 0; b < bones_.size(); ++b)
+						{
+							const int parent = bones_[b].parent;
+							if (mark[b] || parent < 0 ||
+								!mark[static_cast<size_t>(parent)])
+								continue;
+							mark[b] = 1;
+							changed = true;
+						}
+					}
+					sequences_[s].mdlScaledBones = mark;
+				}
+			}
+		}
+
+		return static_cast<int>(parsed.size());
 	}
 
 	namespace
@@ -776,6 +1083,13 @@ namespace cso_gui
 		struct Quaternion
 		{
 			float w = 1.0f, x = 0.0f, y = 0.0f, z = 0.0f;
+		};
+
+		// Local transform of one bone: translation + rotation.
+		struct BonePose
+		{
+			StudioModel::Vec3 pos;
+			Quaternion q;
 		};
 
 		Quaternion QuaternionFromEuler(const StudioModel::Vec3 &rot)
@@ -919,6 +1233,17 @@ namespace cso_gui
 			return idx < channel.size() ? static_cast<float>(channel[idx]) : 0.0f;
 		}
 
+		// Value of the key *after* `held` for interpolation. If the channel has no
+		// such key (last span of the channel) keep the current value instead of
+		// reading 0, which would mean "rest pose" and make the animation slide
+		// back to the bind pose.
+		float NextKeyOrHold(const StudioModel::AnimChannel &channel, size_t pos,
+			size_t index, float held)
+		{
+			const size_t idx = pos + index;
+			return idx < channel.size() ? static_cast<float>(channel[idx]) : held;
+		}
+
 		// Port of HLAM CalculateBonePosition: linear interpolation of a single
 		// position axis, producing the final value for the given frame.
 		float CalcBonePositionAxis(const StudioModel::AnimChannel &channel, int frame,
@@ -946,9 +1271,10 @@ namespace cso_gui
 
 			if (total <= k + 1)
 			{
+				const float held = SafeValue(channel, pos, valid);
 				return base +
-					(SafeValue(channel, pos, valid) * (1.0f - fract) +
-						fract * SafeValue(channel, pos, valid + 2)) * scale;
+					(held * (1.0f - fract) +
+						fract * NextKeyOrHold(channel, pos, valid + 2, held)) * scale;
 			}
 			return base + SafeValue(channel, pos, valid) * scale;
 		}
@@ -982,7 +1308,7 @@ namespace cso_gui
 				}
 				else
 				{
-					v2 = SafeValue(channel, pos, valid + 2);
+					v2 = NextKeyOrHold(channel, pos, valid + 2, v1);
 				}
 			}
 			else
@@ -991,12 +1317,23 @@ namespace cso_gui
 				if (total > k + 1)
 					v2 = v1;
 				else
-					v2 = SafeValue(channel, pos, valid + 2);
+					v2 = NextKeyOrHold(channel, pos, valid + 2, v1);
 			}
 
 			angle1 = base + v1 * scale;
 			angle2 = base + v2 * scale;
 		}
+	}
+
+	void StudioModel::SetBlending(int index, float value)
+	{
+		if (index >= 0 && index < 2)
+			blending_[index] = std::clamp(value, 0.0f, 255.0f);
+	}
+
+	float StudioModel::Blending(int index) const
+	{
+		return index >= 0 && index < 2 ? blending_[index] : 0.0f;
 	}
 
 	void StudioModel::ApplyFrame(int sequenceIndex, float frame)
@@ -1015,58 +1352,165 @@ namespace cso_gui
 				decodedSequences_[static_cast<size_t>(sequenceIndex)];
 			localBones.resize(bones_.size());
 
-			int frameIdx = static_cast<int>(std::floor(frame));
+			// Same rule as the GoldSource engine (StudioCalcRotations): the last
+			// frame is the end of the loop, anything beyond it restarts at 0.
+			// Without this a frame in (N-1, N) has no "next" key to interpolate
+			// to and the pose slides towards the bone's rest pose.
+			float clampedFrame = frame;
 			if (seq.numframes > 0)
-				frameIdx = frameIdx % seq.numframes;
-			const float fract = frame - std::floor(frame);
+			{
+				if (clampedFrame > static_cast<float>(seq.numframes - 1))
+					clampedFrame = 0.0f;
+				else if (clampedFrame < 0.0f)
+					clampedFrame = 0.0f;
+			}
+			int frameIdx = static_cast<int>(std::floor(clampedFrame));
+			const float fract = clampedFrame - std::floor(clampedFrame);
 
-			const std::vector<BoneAnim> *blend = nullptr;
-			if (!decoded.blends.empty())
-				blend = &decoded.blends[0];
+			// Rotation quantisation step per axis: the bone's own scale for
+			// sequences of the .mdl (and CSO .seq groups 1-2); later .seq groups
+			// store angles as radians * 10240 (so +-pi = +-32170, the maximum seen
+			// in the data is 32169), identical for every bone and axis.
+			constexpr float kUniformRotScale = 1.0f / 10240.0f;
+
+			// Local pose (position + rotation) of every bone for ONE blend of the
+			// sequence (StudioCalcRotations in the engine).
+			const auto computePose = [&](const std::vector<BoneAnim> *blend,
+				std::vector<BonePose> &out)
+			{
+				out.resize(bones_.size());
+				for (size_t i = 0; i < bones_.size(); ++i)
+				{
+					const Bone &bone = bones_[i];
+					Vec3 pos = bone.position;
+					Vec3 rot1 = bone.rotation;
+					Vec3 rot2 = bone.rotation;
+					// A few files mix both encodings: a second skeleton inside
+					// a radians * 10240 file still needs the bone's own scales
+					// (Sequence::mdlScaledBones).
+					const bool mdlScale = !seq.uniformRotationScale ||
+						(i < seq.mdlScaledBones.size() && seq.mdlScaledBones[i] != 0);
+					const float rotScale[3] = {
+						mdlScale ? bone.scale[3] : kUniformRotScale,
+						mdlScale ? bone.scale[4] : kUniformRotScale,
+						mdlScale ? bone.scale[5] : kUniformRotScale };
+
+					if (blend)
+					{
+						const BoneAnim &ba = (*blend)[i];
+						// Position axes X,Y,Z (channels 0..2) are interpolated
+						// linearly. Rotation axes XR,YR,ZR (channels 3..5) are
+						// slerped between quaternions, matching the engine.
+						pos.x = CalcBonePositionAxis(ba.channels[0], frameIdx, fract,
+							bone.position.x, bone.scale[0]);
+						pos.y = CalcBonePositionAxis(ba.channels[1], frameIdx, fract,
+							bone.position.y, bone.scale[1]);
+						pos.z = CalcBonePositionAxis(ba.channels[2], frameIdx, fract,
+							bone.position.z, bone.scale[2]);
+
+						CalcBoneQuaternionAxis(ba.channels[3], frameIdx,
+							bone.rotation.x, rotScale[0], rot1.x, rot2.x);
+						CalcBoneQuaternionAxis(ba.channels[4], frameIdx,
+							bone.rotation.y, rotScale[1], rot1.y, rot2.y);
+						CalcBoneQuaternionAxis(ba.channels[5], frameIdx,
+							bone.rotation.z, rotScale[2], rot1.z, rot2.z);
+					}
+
+					if (haveSequence && seq.motionbone == static_cast<int>(i))
+					{
+						// Zero locked motion axes so the model stays rooted
+						// instead of translating along its travel direction.
+						if (seq.motiontype & 1) pos.x = 0.0f;  // X
+						if (seq.motiontype & 2) pos.y = 0.0f;  // Y
+						if (seq.motiontype & 4) pos.z = 0.0f;  // Z
+					}
+
+					// Match HLAM: convert both keyframe Euler rotations to
+					// quaternions, then slerp. Linear Euler interpolation flips
+					// limbs when an angle crosses its wrap boundary.
+					out[i] = { pos, Slerp(QuaternionFromEuler(rot1),
+						QuaternionFromEuler(rot2), fract) };
+				}
+			};
+
+			// SlerpBones of the engine: `to` moves towards `from` by s.
+			const auto slerpBones = [&](std::vector<BonePose> &to,
+				const std::vector<BonePose> &from, double sd)
+			{
+				const float t = static_cast<float>(std::clamp(sd, 0.0, 1.0));
+				for (size_t i = 0; i < to.size(); ++i)
+				{
+					to[i].q = Slerp(to[i].q, from[i].q, t);
+					to[i].pos = to[i].pos * (1.0f - t) + from[i].pos * t;
+				}
+			};
+
+			// A sequence may hold several blends (CS player models: 9 = a 3x3 grid
+			// of aim directions, rest neighbours). The engine mixes them with the
+			// "blending" controllers; blend 0 alone is just one corner of the grid
+			// (head/torso/arms visibly turned). Same algorithm as the engine and as
+			// HLAM's BoneTransformer::SetUpBones.
+			const auto &blends = decoded.blends;
+			const size_t blendCount = blends.size();
+			std::vector<BonePose> poses[4];
+			if (blendCount == 9)
+			{
+				const double bx = blending_[0], by = blending_[1];
+				double ix, iy;
+				size_t pick[4];
+				if (bx > 127.0)
+				{
+					ix = (bx - 127.0) * 2.0;
+					if (by > 127.0)
+					{
+						iy = (by - 127.0) * 2.0;
+						pick[0] = 4; pick[1] = 5; pick[2] = 7; pick[3] = 8;
+					}
+					else
+					{
+						iy = by * 2.0;
+						pick[0] = 1; pick[1] = 2; pick[2] = 4; pick[3] = 5;
+					}
+				}
+				else
+				{
+					ix = bx * 2.0;
+					if (by <= 127.0)
+					{
+						iy = by * 2.0;
+						pick[0] = 0; pick[1] = 1; pick[2] = 3; pick[3] = 4;
+					}
+					else
+					{
+						iy = (by - 127.0) * 2.0;
+						pick[0] = 3; pick[1] = 4; pick[2] = 6; pick[3] = 7;
+					}
+				}
+				for (int k = 0; k < 4; ++k)
+					computePose(&blends[pick[k]], poses[k]);
+				slerpBones(poses[0], poses[1], ix / 255.0);
+				slerpBones(poses[2], poses[3], ix / 255.0);
+				slerpBones(poses[0], poses[2], iy / 255.0);
+			}
+			else
+			{
+				computePose(blendCount > 0 ? &blends[0] : nullptr, poses[0]);
+				if (blendCount > 1)
+				{
+					computePose(&blends[1], poses[1]);
+					slerpBones(poses[0], poses[1], blending_[0] / 255.0);
+					if (blendCount == 4)
+					{
+						computePose(&blends[2], poses[2]);
+						computePose(&blends[3], poses[3]);
+						slerpBones(poses[2], poses[3], blending_[0] / 255.0);
+						slerpBones(poses[0], poses[2], blending_[1] / 255.0);
+					}
+				}
+			}
 
 			for (size_t i = 0; i < bones_.size(); ++i)
-			{
-				const Bone &bone = bones_[i];
-				Vec3 pos = bone.position;
-				Vec3 rot1 = bone.rotation;
-				Vec3 rot2 = bone.rotation;
-
-				if (blend)
-				{
-					const BoneAnim &ba = (*blend)[i];
-					// Position axes X,Y,Z (channels 0..2) are interpolated
-					// linearly. Rotation axes XR,YR,ZR (channels 3..5) are
-					// slerped between quaternions, matching the engine.
-					pos.x = CalcBonePositionAxis(ba.channels[0], frameIdx, fract,
-						bone.position.x, bone.scale[0]);
-					pos.y = CalcBonePositionAxis(ba.channels[1], frameIdx, fract,
-						bone.position.y, bone.scale[1]);
-					pos.z = CalcBonePositionAxis(ba.channels[2], frameIdx, fract,
-						bone.position.z, bone.scale[2]);
-
-					CalcBoneQuaternionAxis(ba.channels[3], frameIdx,
-						bone.rotation.x, bone.scale[3], rot1.x, rot2.x);
-					CalcBoneQuaternionAxis(ba.channels[4], frameIdx,
-						bone.rotation.y, bone.scale[4], rot1.y, rot2.y);
-					CalcBoneQuaternionAxis(ba.channels[5], frameIdx,
-						bone.rotation.z, bone.scale[5], rot1.z, rot2.z);
-				}
-
-				if (haveSequence && seq.motionbone == static_cast<int>(i))
-				{
-					// Zero locked motion axes so the model stays rooted
-					// instead of translating along its travel direction.
-					if (seq.motiontype & 1) pos.x = 0.0f;  // X
-					if (seq.motiontype & 2) pos.y = 0.0f;  // Y
-					if (seq.motiontype & 4) pos.z = 0.0f;  // Z
-				}
-
-				// Match HLAM: convert both keyframe Euler rotations to quaternions,
-				// then slerp. Linear Euler interpolation flips limbs when an angle
-				// crosses its wrap boundary.
-				localBones[i] = QuaternionMatrix(Slerp(
-					QuaternionFromEuler(rot1), QuaternionFromEuler(rot2), fract), pos);
-			}
+				localBones[i] = QuaternionMatrix(poses[0][i].q, poses[0][i].pos);
 		}
 		else
 		{

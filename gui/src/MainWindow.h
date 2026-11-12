@@ -57,11 +57,16 @@ private slots:
 	void OnOpenPaksWithNars();
 	void OnOpenPakFolder();
 	void OnShowAutoNarToggled(bool show);
+	void OnSearchNeighborSeqToggled(bool on);
 	void OnExtractAll();
 	void OnExtractSelected();
 	void OnExtractSelectedDecoded();
 	void OnPackDirectory();
 	void OnPatchArchive();
+	void OnPackNar();
+	void OnPatchNar();
+	void OnUnpackNar();
+	void OnVerifyNarIntegrity();
 	void OnCurrentChanged(const QModelIndex &current, const QModelIndex &previous);
 	void OnTreeDoubleClicked(const QModelIndex &index);
 	void OnTreeContextMenu(const QPoint &pos);
@@ -167,6 +172,19 @@ private:
 	void ShowMedia(const std::vector<uint8_t> &data, const QString &displayName, const QString &fileExtension);
 	void StopMediaPlayback();
 	void ShowModel(const FoundEntry &ref, const std::vector<uint8_t> &data);
+	// CSO keeps part of a model's animations in companion files named
+	// "<model name><N>.seq" next to "<model name>.mdl" (see
+	// StudioModel::AppendExternalSequences). Finds them in the loaded
+	// archives (the model's own archive first, then the others) and, when
+	// searchNeighborSeq_ is on, in the .pak/.nar files lying next to the
+	// loaded ones, and appends their sequences to `model` in ascending N
+	// order. Fills externalSeqInfo_ / externalSeqBase_ for the sequence panel.
+	void LoadExternalSequences(const std::shared_ptr<cso_gui::StudioModel> &model,
+		const FoundEntry &modelRef);
+	// Opens (once per loaded archive set) every .pak/.nar that lies next to
+	// the loaded archives and is not loaded yet into neighborArchives_ /
+	// neighborNarArchives_. Only the entry tables are read.
+	void EnsureNeighborArchivesLoaded();
 	void ShowBsp(const FoundEntry &ref, const std::vector<uint8_t> &data);
 	// Resolves one .wad file to its textures (lowercase name -> image),
 	// searching loaded archives, texture folders, then neighbouring .pak
@@ -346,6 +364,7 @@ private:
 	// file lookup alongside the .pak lists above; the tree view still
 	// shows .pak contents only.
 	std::vector<std::unique_ptr<cso_pak::NarArchive>> narArchives_;
+	QAction *verifyNarAction_ = nullptr;
 	std::vector<std::unique_ptr<cso_pak::NarArchive>> neighborNarArchives_;
 	// Parsed .mdl files placed on the current BSP map (keyed by lowercase
 	// internal path), with external textures already resolved. Session
@@ -356,6 +375,21 @@ private:
 	// with nar contents; resolution always uses every loaded archive either
 	// way. Persisted across restarts.
 	bool showAutoNar_ = false;
+	// Whether external .seq animations are also searched in the .pak/.nar
+	// files next to the loaded ones (opened lazily, see
+	// EnsureNeighborArchivesLoaded). When off, only the archives that are
+	// loaded right now are searched. Off by default (scanning hundreds of
+	// archives delays opening a model). Persisted across restarts.
+	bool searchNeighborSeq_ = false;
+	// Set once the neighbour scan ran for the current archive set; reset by
+	// LoadPaks together with neighborArchives_.
+	bool neighborArchivesScanned_ = false;
+	QAction *searchNeighborSeqAction_ = nullptr;
+	// Summary of the external .seq animations merged into currentModel_
+	// (empty when there are none) and the model's file name without
+	// extension, which names them (<base><N>.seq).
+	QString externalSeqInfo_;
+	QString externalSeqBase_;
 	// Canonical file paths of the auto-loaded (hidden unless shown) .nars.
 	std::set<QString> autoNarPaths_;
 	QAction *showAutoNarAction_ = nullptr;

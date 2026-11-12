@@ -10,8 +10,10 @@
 namespace cso_gui
 {
 	// Parsed Counter-Strike Online / GoldSource studiomdl (.mdl) model.
-	// Supports studio header versions 10 and 11 (Nexon). The two versions
-	// share the same binary layout for everything this parser uses.
+	// Supports studio header versions 10 and 11 (Nexon), plus ICE-encrypted
+	// CSO models (versions 20/21, decrypted on the fly) and their decrypted
+	// form (version 9). All share the same binary layout for everything this
+	// parser uses.
 	class StudioModel
 	{
 	public:
@@ -112,6 +114,26 @@ namespace cso_gui
 			int animindex = 0;
 			int motiontype = 0;  // STUDIO_X/Y/Z bitmask of locked motion axes
 			int motionbone = 0;  // bone index whose motion is locked
+			// 0 = stored inside the .mdl itself; N > 0 = comes from the
+			// external CSO companion file "<model name>N.seq" (see
+			// AppendExternalSequences).
+			int externalGroup = 0;
+			// Quantisation of the rotation channels. false: the usual
+			// mstudiobone_t::scale[3..5] of this .mdl. true: every rotation axis
+			// is radians * 10240 (pi = 32170). Many CSO .seq files (usually groups >= 3,
+			// but some models already from group 2; detected per file from the data) were encoded that way and ignore
+			// the .mdl's per-axis bone scales --
+			// decoding them with those scales shrinks/distorts the angles
+			// (stretched knees, trembling forearms and hands).
+			bool uniformRotationScale = false;
+			// Bones that keep the .mdl's per-axis scales even when
+			// uniformRotationScale is set. Some shop scenes stack a second,
+			// unrelated skeleton into the same .mdl, and its static channels in
+			// those radians * 10240 files only make sense with the .mdl's own
+			// scales; read as radians they fold every limb into the torso.
+			// Non-zero = per-bone scales for that bone index. Empty in the
+			// usual case.
+			std::vector<std::uint8_t> mdlScaledBones;
 		};
 
 		// Raw sequence from the file for one (bone, axis) channel. Each entry is
@@ -140,7 +162,8 @@ namespace cso_gui
 		void Load(const std::vector<uint8_t> &data);
 
 		bool IsValid() const { return valid_; }
-		int Version() const { return version_; }
+		int Version() const { return version_; }  // as stored in the file (20/21 if encrypted)
+		bool WasEncrypted() const { return encrypted_; }
 		const std::string &Name() const { return name_; }
 
 		const std::vector<Bone> &Bones() const { return bones_; }
@@ -151,9 +174,35 @@ namespace cso_gui
 		// Decoded per-sequence animation (empty if a sequence has none).
 		const std::vector<DecodedSequence> &DecodedSequences() const { return decodedSequences_; }
 
+		// CSO keeps a part of a model's animations outside the .mdl, in
+		// companion files named "<model name><N>.seq" (buffclass21s1ct.mdl +
+		// buffclass21s1ct1.seq, ...2.seq, ...). Layout of one .seq file:
+		//   int32 numseq, int32 seqdescOffset          (8-byte header)
+		//   [mstudioevent_t...] [mstudioanim_t + values...]   (data from 8)
+		//   mstudioseqdesc_t[numseq]                   (at seqdescOffset)
+		// The seqdesc pointers (eventindex/pivotindex/animindex) are NOT
+		// file offsets: they keep the addresses they had in the original,
+		// unsplit .mdl. The data block always starts at file offset 8, so
+		// file offset = pointer - (lowest pointer - 8). The animations use
+		// this model's skeleton, so call it after Load().
+		//
+		// Appends the file's sequences to Sequences()/DecodedSequences()
+		// (tagged with externalGroup = groupNumber) and returns how many
+		// were added. Throws std::runtime_error for a malformed file. The
+		// bytes are only read during the call.
+		int AppendExternalSequences(const std::vector<uint8_t> &seqData, int groupNumber);
+
 		// Re-skin every triangle to the given sequence's pose at a fractional
 		// frame index. sequenceIndex -1 (or out of range) applies the rest pose.
 		void ApplyFrame(int sequenceIndex, float frame);
+
+		// Position of the two "blending" controllers (0..255) that mix the blends
+		// of a multi-blend sequence (CS player models: 9 blends = 3x3 grid of aim
+		// directions). Default 127.5 = centre of the range, which is what
+		// HLAM shows and what a model looking straight ahead uses. Applies to
+		// the next ApplyFrame().
+		void SetBlending(int index, float value);
+		float Blending(int index) const;
 
 		// Number of skin families and the skinref table of family 0.
 		int SkinFamilyCount() const { return skinFamilyCount_; }
@@ -180,6 +229,7 @@ namespace cso_gui
 
 		bool valid_ = false;
 		int version_ = 0;
+		bool encrypted_ = false;
 		std::string name_;
 
 		std::vector<Bone> bones_;
@@ -188,6 +238,7 @@ namespace cso_gui
 		std::vector<Sequence> sequences_;
 		std::vector<DecodedSequence> decodedSequences_;
 
+		float blending_[2] = { 127.5f, 127.5f };
 		int skinFamilyCount_ = 0;
 		std::vector<int> skinRefs_;
 
@@ -201,6 +252,10 @@ namespace cso_gui
 		void ParseSkins(const Header &h);
 		void ParseBodyParts(const Header &h);
 		void ParseSequences(const Header &h);
-		void DecodeSequenceAnimation(size_t sequenceIndex);
+		// Decodes sequences_[sequenceIndex] from `data`. `bias` converts the
+		// sequence's animindex into an offset inside `data` (0 for the .mdl
+		// itself, see AppendExternalSequences for .seq files).
+		void DecodeSequenceAnimation(size_t sequenceIndex, const uint8_t *data, size_t size,
+			std::int64_t bias);
 	};
 }

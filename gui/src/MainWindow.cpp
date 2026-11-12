@@ -10,6 +10,7 @@
 #include <QAbstractTextDocumentLayout>
 #include <QAction>
 #include <QApplication>
+#include <QBuffer>
 #include <QByteArrayView>
 #include <QMatrix4x4>
 #include <QDir>
@@ -22,6 +23,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QImageReader>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMenuBar>
@@ -692,6 +694,13 @@ void MainWindow::BuildMenusAndToolbar()
 
 	fileMenu->addAction(tr("&Pack Directory into New Pak..."), this, &MainWindow::OnPackDirectory);
 	fileMenu->addAction(tr("Patch &Archive with Replacements..."), this, &MainWindow::OnPatchArchive);
+	fileMenu->addSeparator();
+	fileMenu->addAction(tr("Pack Directory into New &NAR..."), this, &MainWindow::OnPackNar);
+	fileMenu->addAction(tr("Patch NA&R with Replacements..."), this, &MainWindow::OnPatchNar);
+	fileMenu->addAction(tr("&Unpack NAR to Directory..."), this, &MainWindow::OnUnpackNar);
+	verifyNarAction_ = fileMenu->addAction(tr("Verify NAR Archive &Integrity..."),
+		this, &MainWindow::OnVerifyNarIntegrity);
+	verifyNarAction_->setEnabled(false);
 
 	fileMenu->addSeparator();
 	fileMenu->addAction(tr("E&xit"), this, &QWidget::close);
@@ -715,6 +724,24 @@ void MainWindow::BuildMenusAndToolbar()
 	}
 	showAutoNarAction_->setChecked(showAutoNar_);
 	connect(showAutoNarAction_, &QAction::toggled, this, &MainWindow::OnShowAutoNarToggled);
+
+	searchNeighborSeqAction_ = viewMenu->addAction(
+		tr("Search neighbouring archives for external animations (.seq)"));
+	searchNeighborSeqAction_->setCheckable(true);
+	searchNeighborSeqAction_->setToolTip(tr(
+		"Some animations of a model are stored outside the .mdl, in files "
+		"named <model><N>.seq that may lie in another .pak/.nar than the model. "
+		"On: the .pak/.nar files next to the loaded ones are opened once and "
+		"searched too (slow with hundreds of archives). Off (default): only the "
+		"archives loaded right now are searched. "
+		"Applies to the next model you open."));
+	{
+		const QSettings settings;
+		searchNeighborSeq_ = settings.value(QStringLiteral("searchNeighborSeq"), false).toBool();
+	}
+	searchNeighborSeqAction_->setChecked(searchNeighborSeq_);
+	connect(searchNeighborSeqAction_, &QAction::toggled, this,
+		&MainWindow::OnSearchNeighborSeqToggled);
 
 	// BSP viewer: skybox on/off. Off by default -- the sky faces enclose
 	// parts of the level (rooftops, grates, side walls) and hide the map when
@@ -1075,6 +1102,9 @@ void MainWindow::LoadPaks(const QStringList &paths, bool autoNar)
 	findCache_.clear();
 	neighborArchives_.clear();
 	neighborNarArchives_.clear();
+	neighborArchivesScanned_ = false;
+	externalSeqInfo_.clear();
+	externalSeqBase_.clear();
 	wadImageCache_.clear();
 	placedModelCache_.clear();
 
@@ -1084,6 +1114,7 @@ void MainWindow::LoadPaks(const QStringList &paths, bool autoNar)
 	extractAllAction_->setEnabled(true);
 	extractSelectedAction_->setEnabled(true);
 	extractSelectedDecodedAction_->setEnabled(true);
+	verifyNarAction_->setEnabled(!narArchives_.empty());
 
 	ShowPlaceholder(tr("Select a file in the tree to preview it."));
 
@@ -1149,6 +1180,18 @@ void MainWindow::OnShowAutoNarToggled(bool show)
 	settings.setValue(QStringLiteral("showAutoNar"), show);
 	RebuildTreeViews();
 	treeView_->expandToDepth(0);
+}
+
+void MainWindow::OnSearchNeighborSeqToggled(bool on)
+{
+	searchNeighborSeq_ = on;
+	QSettings settings;
+	settings.setValue(QStringLiteral("searchNeighborSeq"), on);
+	statusBar()->showMessage(on
+		? tr("External animations (.seq) will also be searched in neighbouring archives "
+			"(applies to the next model you open).")
+		: tr("External animations (.seq) will only be searched in the loaded archives "
+			"(applies to the next model you open)."), 6000);
 }
 
 size_t MainWindow::TotalEntryCount() const
@@ -2377,10 +2420,17 @@ void MainWindow::ShowModel(const FoundEntry &ref, const std::vector<uint8_t> &da
 	{
 		currentModel_.reset();
 		externalTextureSources_.clear();
+		externalSeqInfo_.clear();
+		externalSeqBase_.clear();
 		modelView_->Clear();
 		ShowEntryProperties(ref, tr("Failed to parse this .mdl model: %1").arg(QString::fromUtf8(ex.what())));
 		return;
 	}
+
+	// Animations stored outside the .mdl (<model><N>.seq companion files)
+	// join the model's own sequence list before the 3D view and the
+	// sequence combo are built from it.
+	LoadExternalSequences(model, ref);
 
 	// Split world models carry geometry with an empty texture table and
 	// keep the textures in a *t.mdl twin (w_50ae_big.mdl + w_50ae_bigt.mdl).
@@ -2428,10 +2478,56 @@ bool MainWindow::TextureLooksExternal(const cso_gui::StudioModel::Texture &tex)
 	return area > 0 && area <= 64;
 }
 
+namespace
+{
+	// A Windows .ico can carry several sizes/bit depths of the same icon, and
+	// Qt exposes each as a separate "frame". Retail CSO icons usually store a
+	// small (16x16) or 8-bit variant first, so QImage::loadFromData would show
+	// the blurriest copy. Walk the frames and keep the largest one instead;
+	// on equal areas the later frame wins, which is the more colourful one in
+	// the ICOs shipped with the game.
+	QImage DecodeIcoBestFrame(const std::vector<uint8_t> &data)
+	{
+		QBuffer buffer;
+		buffer.setData(reinterpret_cast<const char *>(data.data()), static_cast<qint64>(data.size()));
+		if (!buffer.open(QIODevice::ReadOnly))
+			return {};
+
+		QImageReader reader(&buffer, "ico");
+		const int frameCount = reader.imageCount();
+		QImage best;
+		int bestArea = 0;
+		for (int frame = 0; frame < frameCount; ++frame)
+		{
+			if (!reader.jumpToImage(frame))
+				continue;
+			const QImage image = reader.read();
+			if (image.isNull())
+				continue;
+
+			const int area = image.width() * image.height();
+			if (area >= bestArea)
+			{
+				bestArea = area;
+				best = image;
+			}
+		}
+
+		// imageCount() can be 0/unknown for unusual files; the first frame is
+		// still better than nothing.
+		if (best.isNull())
+			best.loadFromData(reinterpret_cast<const uchar *>(data.data()), static_cast<int>(data.size()));
+		return best;
+	}
+}
+
 QImage MainWindow::DecodeImageData(const std::vector<uint8_t> &data, const QString &extension)
 {
 	if (extension == QLatin1String("tga"))
 		return tga::Load(data);
+
+	if (extension == QLatin1String("ico"))
+		return DecodeIcoBestFrame(data);
 
 	if (extension == QLatin1String("dds"))
 	{
@@ -2867,6 +2963,286 @@ std::shared_ptr<cso_gui::StudioModel> MainWindow::LoadTwinTextureModel(
 	return nullptr;
 }
 
+void MainWindow::EnsureNeighborArchivesLoaded()
+{
+	if (neighborArchivesScanned_)
+		return;
+	// Set up front: a scan the user cancelled is not restarted for every
+	// model they open afterwards.
+	neighborArchivesScanned_ = true;
+
+	std::set<QString> knownPaths;
+	for (const auto &archive : archives_)
+		knownPaths.insert(QFileInfo(QString::fromStdU16String(
+			archive->SourcePath().generic_u16string())).canonicalFilePath());
+	for (const auto &archive : neighborArchives_)
+		knownPaths.insert(QFileInfo(QString::fromStdU16String(
+			archive->SourcePath().generic_u16string())).canonicalFilePath());
+	for (const auto &archive : narArchives_)
+		knownPaths.insert(QFileInfo(QString::fromStdString(
+			archive->SourcePath().generic_string())).canonicalFilePath());
+	for (const auto &archive : neighborNarArchives_)
+		knownPaths.insert(QFileInfo(QString::fromStdString(
+			archive->SourcePath().generic_string())).canonicalFilePath());
+
+	std::set<QString> sourceDirs;
+	for (const auto &archive : archives_)
+		sourceDirs.insert(QFileInfo(QString::fromStdU16String(
+			archive->SourcePath().generic_u16string())).absolutePath());
+	for (const auto &archive : narArchives_)
+		sourceDirs.insert(QFileInfo(QString::fromStdString(
+			archive->SourcePath().generic_string())).absolutePath());
+	// Same CSO layout reasoning as OnOpenPakFolder: .nar files usually sit
+	// in the parent of Packer/, so look there too.
+	{
+		std::set<QString> withParents = sourceDirs;
+		for (const QString &d : sourceDirs)
+		{
+			const QString parent = QFileInfo(d).absoluteDir().absolutePath();
+			if (parent != d)
+				withParents.insert(parent);
+		}
+		sourceDirs = std::move(withParents);
+	}
+
+	QStringList neighbourPaks;
+	for (const QString &dir : sourceDirs)
+	{
+		const QStringList names = QDir(dir).entryList(
+			QStringList() << QStringLiteral("*.pak") << QStringLiteral("*.nar"),
+			QDir::Files | QDir::Readable, QDir::Name | QDir::LocaleAware);
+		for (const QString &name : names)
+		{
+			const QString full = QDir(dir).absoluteFilePath(name);
+			if (knownPaths.insert(QFileInfo(full).canonicalFilePath()).second)
+				neighbourPaks << full;
+		}
+	}
+	if (neighbourPaks.isEmpty())
+		return;
+
+	QProgressDialog progress(
+		tr("Looking for external animations (.seq) in neighbouring archives..."),
+		tr("Cancel"), 0, neighbourPaks.size(), this);
+	progress.setWindowModality(Qt::WindowModal);
+	progress.setMinimumDuration(400);
+
+	for (int i = 0; i < neighbourPaks.size(); ++i)
+	{
+		progress.setValue(i);
+		progress.setLabelText(tr("Opening %1 (%2 of %3)...")
+			.arg(QFileInfo(neighbourPaks[i]).fileName()).arg(i + 1).arg(neighbourPaks.size()));
+		QApplication::processEvents();
+		if (progress.wasCanceled())
+			break;
+
+		const std::filesystem::path path(neighbourPaks[i].toStdU16String());
+		const bool isNar = QFileInfo(neighbourPaks[i]).suffix().compare(
+			QStringLiteral("nar"), Qt::CaseInsensitive) == 0;
+		try
+		{
+			// Only the entry table is read; the file bytes stay on disk.
+			if (isNar)
+				neighborNarArchives_.push_back(std::make_unique<cso_pak::NarArchive>(
+					cso_pak::NarArchive::Load(path)));
+			else
+				neighborArchives_.push_back(std::make_unique<cso_pak::PakArchive>(
+					cso_pak::PakArchive::Load(path)));
+		}
+		catch (const std::exception &)
+		{
+			// Not a readable archive: nothing to search in it.
+		}
+	}
+	progress.setValue(neighbourPaks.size());
+
+	// Earlier misses may be found in the newly opened archives.
+	findCache_.clear();
+}
+
+void MainWindow::LoadExternalSequences(const std::shared_ptr<cso_gui::StudioModel> &model,
+	const FoundEntry &modelRef)
+{
+	externalSeqInfo_.clear();
+	externalSeqBase_.clear();
+	if (!model || !model->IsValid() || model->Bones().empty() || !modelRef.valid())
+		return;
+
+	QString modelPath = modelRef.displayPath();
+	modelPath.replace(QLatin1Char('\\'), QLatin1Char('/'));
+	modelPath = modelPath.toLower();
+	if (!modelPath.endsWith(QStringLiteral(".mdl")))
+		return;
+	const int modelSlash = modelPath.lastIndexOf(QLatin1Char('/'));
+	const QString modelDir = modelSlash >= 0 ? modelPath.left(modelSlash) : QString();
+	const QString modelBase = modelPath.mid(modelSlash + 1,
+		modelPath.size() - modelSlash - 1 - 4);
+	if (modelBase.isEmpty())
+		return;
+	externalSeqBase_ = modelRef.fileName().chopped(4);
+
+	// Keep "path  —  archive" visible while the (possibly long) neighbour
+	// scan runs, and after it: every later status message for this model
+	// is built on top of it instead of replacing it.
+	const QString entryStatus = tr("%1  —  %2")
+		.arg(modelRef.displayPath(), modelRef.archiveName());
+	statusBar()->showMessage(entryStatus);
+
+	if (searchNeighborSeq_)
+		EnsureNeighborArchivesLoaded();
+
+	// group number N -> the "<model>N.seq" entry to use. The first hit wins,
+	// and archives are visited in priority order: the model's own archive,
+	// the other loaded ones, then (if enabled) the neighbours.
+	std::map<int, FoundEntry> found;
+
+	const auto hasSeqExtension = [](const auto &path) -> bool
+	{
+		const size_t n = path.size();
+		return n >= 4 && path[n - 4] == '.' && (path[n - 3] | 0x20) == 's' &&
+			(path[n - 2] | 0x20) == 'e' && (path[n - 1] | 0x20) == 'q';
+	};
+	// Group number if `rawPath` is "<same dir as the model>/<model name><digits>.seq".
+	const auto groupOf = [&](QString rawPath) -> int
+	{
+		rawPath.replace(QLatin1Char('\\'), QLatin1Char('/'));
+		rawPath = rawPath.toLower();
+		const int slash = rawPath.lastIndexOf(QLatin1Char('/'));
+		const QString name = rawPath.mid(slash + 1);
+		const QString stem = name.left(name.size() - 4);
+		if (stem.size() <= modelBase.size() || !stem.startsWith(modelBase))
+			return -1;
+		const QString digits = stem.mid(modelBase.size());
+		if (digits.size() > 4)
+			return -1;
+		for (const QChar ch : digits)
+		{
+			if (ch < QLatin1Char('0') || ch > QLatin1Char('9'))
+				return -1;
+		}
+		// Entry paths may carry a game-dir prefix the model's own path lacks
+		// (or the reverse), as in FindArchiveEntryByPath.
+		const QString entryDir = slash >= 0 ? rawPath.left(slash) : QString();
+		if (entryDir != modelDir &&
+			!entryDir.endsWith(QLatin1Char('/') + modelDir) &&
+			!modelDir.endsWith(QLatin1Char('/') + entryDir))
+			return -1;
+		const int group = digits.toInt();
+		return group > 0 ? group : -1;
+	};
+	const auto scanPak = [&](const cso_pak::PakArchive *archive)
+	{
+		if (archive == nullptr)
+			return;
+		for (const auto &entry : archive->Entries())
+		{
+			if (!hasSeqExtension(entry.path))
+				continue;
+			const int group = groupOf(QString::fromStdU16String(entry.path));
+			if (group < 0 || found.count(group) != 0)
+				continue;
+			FoundEntry hit;
+			hit.pak = archive;
+			hit.pakEntry = &entry;
+			found.emplace(group, hit);
+		}
+	};
+	const auto scanNar = [&](const cso_pak::NarArchive *archive)
+	{
+		if (archive == nullptr)
+			return;
+		for (const auto &entry : archive->Entries())
+		{
+			if (!hasSeqExtension(entry.path))
+				continue;
+			const int group = groupOf(QString::fromStdString(entry.path));
+			if (group < 0 || found.count(group) != 0)
+				continue;
+			FoundEntry hit;
+			hit.nar = archive;
+			hit.narEntry = &entry;
+			found.emplace(group, hit);
+		}
+	};
+
+	scanPak(modelRef.pak);
+	scanNar(modelRef.nar);
+	for (const auto &archive : archives_)
+		scanPak(archive.get());
+	for (const auto &archive : narArchives_)
+		scanNar(archive.get());
+	if (searchNeighborSeq_)
+	{
+		for (const auto &archive : neighborArchives_)
+			scanPak(archive.get());
+		for (const auto &archive : neighborNarArchives_)
+			scanNar(archive.get());
+	}
+	if (found.empty())
+		return;
+
+	std::vector<int> appliedGroups;
+	int appliedSequences = 0;
+	QStringList problems;
+	std::set<int> failedGroups;
+	for (const auto &[group, hit] : found)
+	{
+		try
+		{
+			appliedSequences += model->AppendExternalSequences(hit.extract(), group);
+			appliedGroups.push_back(group);
+		}
+		catch (const std::exception &ex)
+		{
+			failedGroups.insert(group);
+			problems << tr("%1%2.seq skipped: %3")
+				.arg(externalSeqBase_).arg(group).arg(QString::fromUtf8(ex.what()));
+		}
+	}
+
+	// "1-13", "2-13", "1-3, 5" ...
+	const auto formatGroups = [](const std::vector<int> &groups) -> QString
+	{
+		QStringList parts;
+		for (size_t i = 0; i < groups.size();)
+		{
+			size_t j = i;
+			while (j + 1 < groups.size() && groups[j + 1] == groups[j] + 1)
+				++j;
+			parts << (j > i ? QStringLiteral("%1–%2").arg(groups[i]).arg(groups[j])
+				: QString::number(groups[i]));
+			i = j + 1;
+		}
+		return parts.join(QStringLiteral(", "));
+	};
+
+	// Numbers below the highest one found that no archive provided: the
+	// model probably has more animation files than the loaded archives hold.
+	std::vector<int> missingGroups;
+	for (int g = 1; g < found.rbegin()->first; ++g)
+	{
+		if (found.count(g) == 0)
+			missingGroups.push_back(g);
+	}
+
+	QStringList lines;
+	if (appliedSequences > 0)
+		lines << tr("External animations: %1 sequence(s) from %2 .seq file(s) (%3).")
+			.arg(appliedSequences).arg(appliedGroups.size()).arg(formatGroups(appliedGroups));
+	if (!missingGroups.empty())
+		lines << tr("Not found in the searched archives: %1%2.seq.")
+			.arg(externalSeqBase_).arg(formatGroups(missingGroups));
+	lines << problems;
+	externalSeqInfo_ = lines.join(QLatin1Char('\n'));
+
+	// No timeout: a temporary message would expire into an empty status bar
+	// and the path/archive of the model would be lost.
+	statusBar()->showMessage(appliedSequences > 0
+		? tr("%1  —  +%2 external animation(s) from %3 .seq file(s)")
+			.arg(entryStatus).arg(appliedSequences).arg(appliedGroups.size())
+		: entryStatus);
+}
+
 void MainWindow::ResolveExternalTextures(const std::shared_ptr<cso_gui::StudioModel> &model)
 {
 	externalTextureSources_.clear();
@@ -3272,12 +3648,28 @@ void MainWindow::RebuildModelControls()
 		vLayout->addWidget(makeCaption(tr("Sequence")));
 		modelSequenceCombo_ = makeCombo();
 		modelSequenceCombo_->addItem(tr("(rest pose)"));
+		const auto &modelSequences = currentModel_->Sequences();
 		for (int i = 0; i < seqCount; ++i)
+		{
 			modelSequenceCombo_->addItem(DecodeModelText(modelView_->SequenceLabel(i)));
+			// Animations merged in from <model><N>.seq files say where they came from.
+			if (static_cast<size_t>(i) < modelSequences.size() &&
+				modelSequences[static_cast<size_t>(i)].externalGroup > 0)
+			{
+				modelSequenceCombo_->setItemData(i + 1,
+					tr("External animation: %1%2.seq")
+						.arg(externalSeqBase_)
+						.arg(modelSequences[static_cast<size_t>(i)].externalGroup),
+					Qt::ToolTipRole);
+			}
+		}
 		modelSequenceCombo_->setCurrentIndex(modelView_->CurrentSequence() + 1);
 		connect(modelSequenceCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
 			this, &MainWindow::OnModelSequenceChanged);
 		vLayout->addWidget(modelSequenceCombo_);
+
+		if (!externalSeqInfo_.isEmpty())
+			vLayout->addWidget(makeCaption(externalSeqInfo_));
 
 		auto *frameRow = new QHBoxLayout;
 		modelPlayButton_ = new QPushButton(tr("Play"));
@@ -5149,11 +5541,12 @@ void MainWindow::ShowPreviewForFoundEntry(const FoundEntry &ref)
 	static const QStringList nativeImageExtensions = {
 		QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"),
 		QStringLiteral("bmp"), QStringLiteral("gif"), QStringLiteral("ppm"),
+		QStringLiteral("ico"),
 	};
 	if (nativeImageExtensions.contains(ext))
 	{
-		QImage image;
-		if (image.loadFromData(reinterpret_cast<const uchar *>(data.data()), static_cast<int>(data.size())))
+		const QImage image = DecodeImageData(data, ext);
+		if (!image.isNull())
 		{
 			ShowImage(image);
 			return;
