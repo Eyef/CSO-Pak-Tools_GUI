@@ -21,6 +21,18 @@ add_library(cso_pak_core STATIC
 	core/NarArchive.cpp
 	core/NarBZip2.h
 	core/NarBZip2.cpp
+	core/NarBZip2Enc.cpp
+	core/NarCommon.h
+	core/NarWriter.h
+	core/NarWriter.cpp
+	core/NarTools.h
+	core/NarTools.cpp
+	core/NarCli.h
+	core/NarCli.cpp
+	core/IceCipher.h
+	core/IceCipher.cpp
+	core/ModelCrypt.h
+	core/ModelCrypt.cpp
 )
 target_include_directories(cso_pak_core PUBLIC core)
 
@@ -50,6 +62,7 @@ add_executable(cso-pak-gui WIN32
 	gui/src/main.cpp
 	gui/src/MainWindow.h
 	gui/src/MainWindow.cpp
+	gui/src/MainWindowNar.cpp
 	gui/src/PakTreeModel.h
 	gui/src/PakTreeModel.cpp
 	gui/src/TgaImage.h

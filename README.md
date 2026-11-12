@@ -1,33 +1,44 @@
 # CSO Pak Browser
 
 An Explorer-style GUI on top of the original `cso_pak` console tool: folder
-tree on the left, live preview on the right, plus pack/patch from the same
-File menu. Besides `.pak` it reads Nexon `.nar` archives (where CSO keeps most
-models) and previews text, images (TGA/DDS/WAD textures), audio/video, CSV
-tables, `.mdl` models and `.spr` sprites in 3D/animated viewers, and whole
-`.bsp` maps with baked lighting, placed models/sprites and an optional skybox.
+tree on the left, live preview on the right, plus pack/patch for both `.pak`
+and Nexon `.nar` from the same File menu. Besides `.pak` it reads Nexon `.nar`
+archives (where CSO keeps most models), and it can write `.nar` archives back
+(raw/XOR/LZ storage, optional ICE model encryption), so repacking and patching
+retail CSO data needs no external tools. It previews text, images
+(TGA/DDS/WAD textures and `.ico` icons), audio/video, CSV tables, `.mdl`
+models and `.spr` sprites in 3D/animated viewers, and whole `.bsp` maps with
+baked lighting, placed models/sprites and an optional skybox.
 
 ```
 project/
 ├── CMakeLists.txt
 ├── CMakeUserPresets.json         points CMake at the local Qt install (see "Building")
-├── core/                         shared library `cso_pak_core` + the original console tool (11 files)
+├── core/                         shared library `cso_pak_core` + console tool (23 files)
 │   ├── Main.cpp                    console tool (unpack/pack/patch), builds as cso-pak-cli
 │   ├── PakArchive.h/.cpp           .pak reader/writer; small API addition for the GUI
 │   ├── SnowCipher.h/.cpp           Snow cipher used by the pak format (unchanged)
 │   ├── CsoDecoder.h/.cpp           second-layer TEA decryption for .cso table entries
 │   ├── NarArchive.h/.cpp           Nexon .nar archive reader (directory + on-demand extraction)
-│   └── NarBZip2.h/.cpp             minimal bzip2 decoder for the .nar directory blob
+│   ├── NarBZip2.h/.cpp             minimal bzip2 decoder for the .nar directory blob
+│   ├── NarBZip2Enc.cpp             bzip2 encoder used to write the .nar directory
+│   ├── NarCommon.h                 signatures, keys, CRC-32 and LZ constants shared by reader/writer
+│   ├── NarWriter.h/.cpp            .nar writer: raw/XOR/LZ storage, directory, temp file + rename
+│   ├── NarTools.h/.cpp             unpack/pack/patch + `.nar-info.json` manifest
+│   ├── NarCli.h/.cpp               `nar-list`/`nar-unpack`/`nar-extract`/`nar-pack`/`nar-patch`
+│   ├── IceCipher.h/.cpp            ICE block cipher (CSO model crypto)
+│   └── ModelCrypt.h/.cpp           .mdl v20/21 <-> plain (v9) texture/vertex ICE encryption
 └── gui/
     ├── resources/
     │   ├── app.rc                  Windows resource script: exe icon + version/author info
     │   └── cpb.ico                 exe file icon
-    └── src/                      Qt GUI (26 files)
+    └── src/                      Qt GUI (27 files)
         ├── main.cpp                Qt application entry point
         ├── MainWindow.h/.cpp       window layout, tree wiring, preview dispatch, extraction,
-        │                            pack/patch, and everything that feeds the viewers: texture/model
-        │                            resolution across archives, .wad lookup, BSP map assembly
-        │                            (placed models, sprites, skybox)
+        │                            pak pack/patch, and everything that feeds the viewers:
+        │                            texture/model resolution across archives, .wad lookup, BSP
+        │                            map assembly (placed models, sprites, skybox)
+        ├── MainWindowNar.cpp       NAR pack/patch/unpack/verify actions (delegates to core/NarTools)
         ├── PakTreeModel.h/.cpp     QAbstractItemModel that turns entry paths of every loaded
         │                            .pak/.nar (and the lumps of .wad files) into one folder tree
         ├── TgaImage.h/.cpp         small standalone .tga decoder (Qt has no built-in TGA support)
@@ -83,9 +94,12 @@ straight from disk on demand. The public API is unchanged, but this is what
 lets the GUI keep hundreds of archives open at once without holding
 gigabytes of payload data in RAM.
 
-`NarArchive` / `NarBZip2` are new: Counter-Strike Online ships most models,
-sprites and textures in Nexon `.nar` archives (`Data/*.nar`) rather than in
-the `.pak` files. A `.nar` ends with an XOR-obfuscated, bzip2-compressed
+`NarArchive` / `NarBZip2` are the read side: Counter-Strike Online ships most
+models, sprites and textures in Nexon `.nar` archives (`Data/*.nar`) rather
+than in the `.pak` files. The write side (`NarWriter`, `NarBZip2Enc`,
+`NarTools`, `NarCli`, `IceCipher`, `ModelCrypt`) is described under
+[".nar write support and ICE models"](#nar-write-support-and-ice-models)
+below. A `.nar` ends with an XOR-obfuscated, bzip2-compressed
 directory; `NarArchive::Load` decodes only that directory (via the built-in
 `NarBZip2` decoder, which verifies block CRCs) and `ExtractEntry` reads and
 decodes a single file on demand (raw, XOR-encoded, or XOR-encoded + LZSS
@@ -156,7 +170,7 @@ toolbar, then **Build → Build All**. To debug, select `cso-pak-gui.exe` as
 the startup item and press F5.
 
 <details>
-    
+
 ### Debug vs RelWithDebInfo
 
 - **RelWithDebInfo** = the Release build plus debug info (`/Zi`, linker
@@ -280,11 +294,11 @@ whole step.
   Only each archive's entry table is kept in memory — file bytes are read
   from disk on demand when you preview or extract something — so opening
   hundreds of archives (several GB on disk) doesn't balloon RAM usage.
-- **File → Recent Files** lists the last 10 successfully opened `.pak`
-  paths (newest first), persisted across restarts via `QSettings` — handy
-  with a large collection of pak files where you keep going back to a
-  handful of specific ones (character models in one, effects in another,
-  data tables in a third...). A path that's been moved/deleted since shows
+- **File → Recent Files** lists the last 10 successfully opened archive
+  paths (`.pak`/`.nar`, newest first), persisted across restarts via
+  `QSettings` — handy with a large collection of pak files where you keep
+  going back to a handful of specific ones (character models in one, effects
+  in another, data tables in a third...). A path that's been moved/deleted since shows
   a "file no longer exists" message instead of silently doing nothing.
   **Clear Recent Files** at the bottom empties the list.
 - Click a file to preview it on the right:
@@ -295,7 +309,10 @@ whole step.
     the file's own bitmasks describe). Only mip level 0 is decoded — plenty
     for a preview. BC4-7/ATI2 and DX10-extended-header DDS files aren't
     supported and fall back to the properties panel with the reason why.
-  - `.png/.jpg/.bmp/.gif/.ppm` → shown natively via Qt in case any turn up.
+  - `.png/.jpg/.bmp/.gif/.ppm/.ico` → shown natively via Qt in case any turn
+    up. A multi-size `.ico` (the ones in `cstrike.nar` carry up to six
+    variants) shows its largest frame instead of the first, which is usually
+    the sharpest and most colourful one.
   - `.wad` (WAD2/Quake or WAD3/Half-Life-GoldSource — CSO's own are WAD3) is
     "an archive inside the archive": it shows up in the tree with a
     distinct icon and an expand arrow, like a folder, with its own lumps as
@@ -394,6 +411,23 @@ whole step.
     a texture entry → **Export texture...** saves it as BMP/PNG/JPEG.
     Textureless world models (`w_xxx_big.mdl`) automatically take their
     textures from the twin `w_xxx_bigt.mdl` texture file.
+    Part of a model's animations can live outside the `.mdl`, in companion
+    files named `<model name><N>.seq` (`buffclass21s1ct.mdl` +
+    `buffclass21s1ct1.seq` ... `buffclass21s1ct13.seq`). They are found
+    automatically and appended to the model's **Sequence** list in ascending
+    N order (hover an entry to see its file). The model's own archive is
+    searched first, then every other loaded archive and, with **View >
+    Search neighbouring archives for external animations (.seq)** on (the
+    default), the `.pak`/`.nar` files lying next to the loaded ones, which
+    are opened once per session. A line under the sequence list reports
+    which files were used and which numbers below the highest one were not
+    found. A `.seq` file is `int32 numseq, int32 seqdescOffset`, the
+    events/animation data from offset 8, and the `mstudioseqdesc_t` table
+    at `seqdescOffset`; the pointers inside it are addresses of the original
+    unsplit model, so `file offset = pointer - (lowest pointer - 8)`
+    (`StudioModel::AppendExternalSequences`). A `.seq` that does not fit the
+    model's skeleton is rejected. Models placed on a BSP map do not load
+    `.seq` files.
     Some models only *name* a texture (CSO's own convention: a `#`-prefixed
     name, or a tiny placeholder image like 4×1) and ship the real pixels as
     a separate loose file elsewhere in the same pak — the tool searches
@@ -532,7 +566,10 @@ whole step.
 - **File → Extract All...** — same as the console tool's `unpack` command
   (in multi-pak mode: the whole merged tree; same virtual paths coming
   from different archives are all written, later ones with a
-  `__from_<pakname>` suffix instead of overwriting each other).
+  `__from_<pakname>` suffix instead of overwriting each other). For `.nar`
+  entries this writes the files after XOR/LZ decoding only: ICE-encrypted
+  models stay encrypted and no `.nar-info.json` is written — use **File →
+  Unpack NAR to Directory...** for a full, repack-ready extraction.
 - **File → Extract Selected...** / right-click a selection — extracts just
   the selected files/folders (recursing into folders) to a folder you pick
   (same `__from_<pakname>` disambiguation for duplicates).
@@ -548,6 +585,11 @@ whole step.
   source `.pak`, a folder of replacement files, and an output path.
   Independent of whatever's currently open in the tree. Offers to open the
   result once it's done, for both Pack and Patch.
+- **File → Pack Directory into New NAR...**, **Patch NAR with
+  Replacements...**, **Unpack NAR to Directory...** and **Verify NAR Archive
+  Integrity...** — the `.nar` counterparts of the actions above; see
+  [".nar write support and ICE models"](#nar-write-support-and-ice-models)
+  for their options.
 
 ## Known limitations
 
@@ -564,9 +606,22 @@ whole step.
   commented in the shader.
 - A map's skybox only shows if its images are found in the loaded archives.
 
-- Compressed entries (`type & Compressed`) can't be previewed or extracted —
-  that was already true of `UnpackToDirectory`; `ExtractEntry` just surfaces
-  it as a message instead of a crash.
+- Compressed entries (`type & Compressed`) in `.pak` files can't be previewed
+  or extracted — that was already true of `UnpackToDirectory`; `ExtractEntry`
+  just surfaces it as a message instead of a crash. (`.nar` type-2
+  “encoded+compressed” entries are fully supported.)
+- NAR repacking is semantically lossless, not byte-identical. Every entry's
+  decoded content, path, storage type and timestamp survive, but entries
+  stored as type 2 are recompressed by this project's own greedy LZ encoder,
+  so their stored bytes, sizes, CRCs and offsets can differ from the retail
+  packer's. `nar-patch` copies untouched entries byte-for-byte, and raw-only
+  archives come out byte-identical in the data region; the bzip2 directory
+  stream itself is standards-compliant but may differ from the original
+  packer's output.
+- `nar-unpack` sets file mtimes only for entries whose directory timestamp is
+  non-zero (zero means “no timestamp”). Repacking such a file gives it the
+  current time instead. No such entries were found in the retail archives
+  checked so far.
 - Individual lumps inside a `.wad` can be previewed and saved as images, but
   not extracted as raw lumps: right-click one lump → **Save Texture As
   Image...** (PNG/BMP/JPEG) or several → **Save N Textures As PNG...**
@@ -611,3 +666,49 @@ whole step.
   your `paintGL` calls and can leave blend state on afterward — confirmed
   directly (forcing a second frame of the same model showed `GL_BLEND`
   already enabled on entry, before the reset ran).
+
+## NAR write support and ICE models
+
+All of this lives in `core/` and has no Qt dependency:
+
+| File | What it does |
+|---|---|
+| `IceCipher`, `ModelCrypt` | ICE (level 4) and CSO model encryption: `.mdl` version 20/21 <-> plain (version 9). Encrypts texture pixels+palette and vertex arrays. |
+| `NarWriter`, `NarBZip2Enc.cpp` | Writes `.nar`: LZ compressor (type 2), XOR encoder (type 1), raw (type 0), bzip2-compressed directory, CRC-32. Temp file + rename, nothing is touched if a step fails. |
+| `NarTools` | `ExtractNarToDirectory`, `PackDirectoryToNar`, `PatchNar` + `.nar-info.json` manifest (compatible with CSNZ-Nar's manifest schema). |
+| `NarCli` | CLI commands below. |
+
+`NarArchive` additionally exposes `Entry::timestamp`, `ReadStored()` and `VerifyEntry()` (CRC-32 of the stored bytes).
+`StudioModel::Load` decrypts ICE models (v20/21) transparently and accepts plain v9/v10/v11.
+
+CLI (`cso-pak-cli`):
+
+    nar-list   <archive.nar> [--verify]
+    nar-unpack <archive.nar> [output_dir] [--keep-encrypted] [--verify] [--no-manifest]
+    nar-extract <archive.nar> <path_text> [output_dir] [--keep-encrypted] [--verify]   (single entries, fast on huge archives)
+    nar-pack   <input_dir> <output.nar> [--type raw|enc|lz] [--root NAME] [--encrypt-models 20|21] [--no-manifest]
+    nar-patch  <source.nar> <replacement_dir> <output.nar> [--type ...] [--add-new --root NAME] [--encrypt-models 20|21]
+
+`nar-unpack` decrypts models and writes `.nar-info.json`; `nar-pack` on that folder restores storage types,
+model encryption, data-block order and directory order automatically (the manifest is searched in the
+input folder and up to two parents, and is never packed itself). Without a manifest the input folder's name
+becomes the archive root (`cstrike/` -> `/cstrike/...`), override with `--root` (or `--root ""` for no root);
+files not listed in a manifest use `--type`, whose default is `enc` (XOR-encoded, no compression), and plain
+`.mdl` files stay unencrypted unless `--encrypt-models 20|21` is given. `nar-patch` copies untouched entries
+byte-for-byte (no re-compression) and keeps replaced ICE models encrypted; `--add-new` requires `--root`
+because new files have no archive path to inherit.
+
+### NAR in the GUI (File menu)
+
+- **Pack Directory into New NAR...** — same as `nar-pack`: store type for new files (Encoded by default,
+  LZ, or Raw), ICE encryption for plain `.mdl` files (v20/v21 or leave as is), optional reuse of
+  `.nar-info.json`, and an optional archive root (empty = use the input folder's name; a checkbox for no
+  root at all).
+- **Patch NAR with Replacements...** — same as `nar-patch`: replace files by full archive path or unique
+  path suffix, optionally add new files under a root folder, and choose the store type and ICE version for
+  new files. Replaced models that were ICE-encrypted stay encrypted automatically. The output must be a
+  different file from the source.
+- **Unpack NAR to Directory...** — same as `nar-unpack`: optional ICE decryption, `.nar-info.json`
+  manifest, and optional CRC verification of every entry.
+- **Verify NAR Archive Integrity...** — recomputes the CRC-32 of every entry in every loaded `.nar` and
+  reports mismatches; enabled whenever at least one `.nar` is open.
