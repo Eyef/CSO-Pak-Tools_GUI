@@ -10,19 +10,18 @@
 #include <stdexcept>
 
 #include "NarBZip2.h"
+#include "NarCommon.h"
 
 namespace cso_pak
 {
 	namespace
 	{
-		constexpr uint32_t kSignature = 0x0052414Eu;  // "NAR\0" little-endian
-		constexpr uint32_t kVersion = 0x01000000u;
-		constexpr uint32_t kHeaderSizeXor = 0x4076551Fu;
-		constexpr uint8_t kHeaderXor[16] = {
-			0x19, 0x5B, 0x7B, 0x2C, 0x65, 0x5E, 0x79, 0x25,
-			0x6E, 0x4B, 0x07, 0x21, 0x62, 0x7F, 0x00, 0x29
-		};
-		constexpr size_t kDictMax = 8192;
+		using nar::kSignature;
+		using nar::kVersion;
+		using nar::kHeaderSizeXor;
+		using nar::kHeaderXor;
+		using nar::kDictMax;
+		using nar::MakeEntryKey;
 
 		uint32_t ReadU32LE(const uint8_t *p)
 		{
@@ -36,27 +35,6 @@ namespace cso_pak
 			uint16_t v = 0;
 			std::memcpy(&v, p, 2);
 			return v;
-		}
-
-		// Python string hash (as in NARTools' decoder): h = h*1000003 ^ b,
-		// then h ^= length. All arithmetic wraps mod 2^32.
-		uint32_t PythonHash(const uint8_t *data, size_t size)
-		{
-			uint32_t hash = 0;
-			for (size_t i = 0; i < size; ++i)
-				hash = hash * 1000003u ^ data[i];
-			return hash ^ static_cast<uint32_t>(size);
-		}
-
-		// 16-byte XOR keystream from the entry path bytes.
-		void MakeEntryKey(const uint8_t *pathBytes, size_t pathSize, uint8_t key[16])
-		{
-			uint32_t seed = PythonHash(pathBytes, pathSize);
-			for (int i = 0; i < 16; ++i)
-			{
-				seed = seed * 1103515245u + 12345u;
-				key[i] = static_cast<uint8_t>(seed & 255u);
-			}
 		}
 
 		// Custom LZSS used by .nar (dictionary 8192, commands: 0lllll =
@@ -230,6 +208,7 @@ namespace cso_pak
 			entry.offset = ReadU32LE(f + 4);
 			entry.storedSize = static_cast<uint32_t>(static_cast<int32_t>(ReadU32LE(f + 8)));
 			entry.extractedSize = static_cast<uint32_t>(static_cast<int32_t>(ReadU32LE(f + 12)));
+			entry.timestamp = ReadU32LE(f + 16);
 			entry.checksum = ReadU32LE(f + 20);
 			if (entry.type > 2)
 				throw std::runtime_error("nar: unsupported entry type");
@@ -244,9 +223,9 @@ namespace cso_pak
 		return archive;
 	}
 
-	std::vector<uint8_t> NarArchive::ExtractEntry(const Entry &entry) const
+	std::vector<uint8_t> NarArchive::ReadStored(const Entry &entry) const
 	{
-		if (entry.extractedSize == 0)
+		if (entry.storedSize == 0)
 			return {};
 		if (stream_ == nullptr)
 		{
@@ -263,9 +242,52 @@ namespace cso_pak
 		file->clear();
 		file->seekg(static_cast<int64_t>(entry.offset), std::ios::beg);
 		std::vector<uint8_t> stored(entry.storedSize);
-		if (entry.storedSize > 0 &&
-			!file->read(reinterpret_cast<char *>(stored.data()), entry.storedSize))
+		if (!file->read(reinterpret_cast<char *>(stored.data()), entry.storedSize))
 			throw std::runtime_error("nar: cannot read entry data");
+		return stored;
+	}
+
+	bool NarArchive::VerifyEntry(const Entry &entry) const
+	{
+		if (entry.storedSize == 0)
+			return entry.checksum == 0 || entry.checksum == nar::Crc32::Of(nullptr, 0);
+		// Streamed in 64 KiB pieces so verifying a multi-gigabyte archive
+		// never holds a whole entry in memory.
+		if (stream_ == nullptr)
+		{
+			auto *file = new std::ifstream(sourcePath_, std::ios::binary);
+			if (!*file)
+			{
+				delete file;
+				throw std::runtime_error("nar: cannot reopen file");
+			}
+			stream_ = file;
+		}
+		auto *file = static_cast<std::ifstream *>(stream_);
+		file->clear();
+		file->seekg(static_cast<int64_t>(entry.offset), std::ios::beg);
+
+		nar::Crc32 crc;
+		std::array<uint8_t, 65536> buf;
+		uint32_t remaining = entry.storedSize;
+		while (remaining > 0)
+		{
+			const size_t want = remaining < buf.size() ? remaining : buf.size();
+			file->read(reinterpret_cast<char *>(buf.data()), static_cast<std::streamsize>(want));
+			const size_t got = static_cast<size_t>(file->gcount());
+			if (got == 0)
+				throw std::runtime_error("nar: truncated entry data");
+			crc.Update(buf.data(), got);
+			remaining -= static_cast<uint32_t>(got);
+		}
+		return crc.Value() == entry.checksum;
+	}
+
+	std::vector<uint8_t> NarArchive::ExtractEntry(const Entry &entry) const
+	{
+		if (entry.extractedSize == 0)
+			return {};
+		std::vector<uint8_t> stored = ReadStored(entry);
 
 		if (entry.type == 0)
 		{

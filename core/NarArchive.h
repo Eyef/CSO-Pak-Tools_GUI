@@ -32,7 +32,8 @@ namespace cso_pak
 			uint32_t storedSize = 0;
 			uint32_t extractedSize = 0;
 			uint32_t type = 0;  // 0 = raw, 1 = encoded, 2 = encoded+compressed
-			uint32_t checksum = 0;
+			uint32_t timestamp = 0;  // Unix seconds (directory field at +16)
+			uint32_t checksum = 0;   // CRC-32 of the STORED bytes
 
 			// ASCII-widened path for display/matching (non-ASCII -> '?').
 			std::u16string generic_u16string() const;
@@ -54,6 +55,14 @@ namespace cso_pak
 		static std::string FileNameOf(const std::string &path);
 
 		std::vector<uint8_t> ExtractEntry(const Entry &entry) const;
+
+		// The entry's bytes exactly as they sit in the archive (still
+		// XOR-encoded / compressed). Used to copy untouched entries into a
+		// rewritten archive without re-compressing them.
+		std::vector<uint8_t> ReadStored(const Entry &entry) const;
+
+		// CRC-32 of the stored bytes against the directory's checksum.
+		bool VerifyEntry(const Entry &entry) const;
 
 	private:
 		std::vector<Entry> entries_;

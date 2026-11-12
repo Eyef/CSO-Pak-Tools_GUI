@@ -14,4 +14,11 @@ namespace cso_pak
 	// Huffman -> [stream]; decode in reverse). Throws std::runtime_error
 	// on malformed input, including block CRC mismatches.
 	std::vector<uint8_t> DecompressBZip2(const uint8_t *data, size_t size);
+
+	// Minimal bzip2 compressor, the counterpart of DecompressBZip2: emits a
+	// standard single-stream .bz2 (any bzip2 tool can read it). One Huffman
+	// table, no multi-table optimisation -- it's meant for the .nar
+	// directory blob, where the reference writers use block size 1 (100k).
+	// `blockSize100k` is 1..9.
+	std::vector<uint8_t> CompressBZip2(const uint8_t *data, size_t size, int blockSize100k = 1);
 }

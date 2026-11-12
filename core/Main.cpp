@@ -1,3 +1,4 @@
+#include "NarCli.h"
 #include "PakArchive.h"
 
 #include <algorithm>
@@ -32,7 +33,8 @@ namespace
 			<< "  " << programName << " unpack <source.pak> [output_root]\n"
 			<< "  " << programName << " unpack <source_dir> [output_root]\n"
 			<< "  " << programName << " pack <input_dir> <output.pak>\n"
-			<< "  " << programName << " patch <source.pak> <replacement_dir> <output.pak>\n\n";
+			<< "  " << programName << " patch <source.pak> <replacement_dir> <output.pak>\n";
+		cso_pak::PrintNarUsage(programName.c_str());
 	}
 
 	bool IsPakFile(const std::filesystem::path &path)
@@ -182,7 +184,14 @@ int main(int argc, char **argv)
 		}
 
 		const std::string_view command = argv[1];
-		int result = 2;
+		int result = cso_pak::RunNarCommand(command, argc, argv);
+		if (result != -1)
+		{
+			if (result == 2)
+				PrintUsage(argv[0]);
+			return result;
+		}
+		result = 2;
 		if (command == "unpack"sv)
 			result = RunUnpack(argc, argv);
 		else if (command == "pack"sv)
