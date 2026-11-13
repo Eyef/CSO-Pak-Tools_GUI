@@ -62,6 +62,73 @@ namespace cso_gui
 		{
 			return offset <= total && count <= total - offset;
 		}
+		// Size of one per-bone animation record (mstudioanim_t) of a
+		// sequence whose record table starts at `local`:
+		//  * 12 bytes: 6 x uint16 stream offsets (pos xyz, rot xyz) -- every
+		//    older file and most 2026 ones;
+		//  * 24 bytes: 6 x uint32 offsets, used by 2026 sequences whose
+		//    packed streams exceed 64 KB (e.g. the long emotion01..04 of
+		//    buffclass26s4tr3.seq; those seqdescs carry flag 2).
+		// In both cases the record table is followed directly by the streams,
+		// which identifies the layout. Returns 0 when neither fits (animation
+		// made for another skeleton); *hasStreams is false for a static pose
+		// (no offsets at all), where `preferWide` decides.
+		size_t DetectAnimRecordStride(const uint8_t *data, size_t size, size_t local,
+			int numBlends, size_t numBones, bool preferWide, bool *hasStreams)
+		{
+			const size_t count = static_cast<size_t>(numBlends) * numBones;
+			const size_t order[2] = { preferWide ? size_t(24) : size_t(12),
+				preferWide ? size_t(12) : size_t(24) };
+			*hasStreams = true;
+			bool staticPose = false;
+			size_t staticStride = 0;
+			for (const size_t stride : order)
+			{
+				if (!InRange(local, stride * count, size))
+					continue;
+				size_t lowest = std::numeric_limits<size_t>::max();
+				for (size_t r = 0; r < count; ++r)
+				{
+					const size_t record = local + r * stride;
+					for (size_t axis = 0; axis < 6; ++axis)
+					{
+						size_t offset;
+						if (stride == 12)
+						{
+							std::uint16_t v;
+							std::memcpy(&v, data + record + axis * 2, sizeof(v));
+							offset = v;
+						}
+						else
+						{
+							std::uint32_t v;
+							std::memcpy(&v, data + record + axis * 4, sizeof(v));
+							offset = v;
+						}
+						if (offset != 0)
+							lowest = std::min(lowest, record + offset);
+					}
+				}
+				if (lowest == std::numeric_limits<size_t>::max())
+				{
+					if (!staticPose)
+					{
+						staticPose = true;
+						staticStride = stride;
+					}
+					continue;
+				}
+				if (lowest == local + stride * count)
+					return stride;
+			}
+			if (staticPose)
+			{
+				*hasStreams = false;
+				return staticStride;
+			}
+			return 0;
+		}
+
 	}
 
 	struct StudioModel::Header
@@ -722,6 +789,7 @@ namespace cso_gui
 			seq.animindex = Int(off + 124);
 			seq.motiontype = Int(off + 68);
 			seq.motionbone = Int(off + 72);
+			seq.flags = Int(off + 36);
 			sequences_.push_back(std::move(seq));
 		}
 
@@ -746,12 +814,16 @@ namespace cso_gui
 		if (localAnimIndex < 0)
 			return;
 
-		// mstudioanim_t: 6 x uint16 offsets (12 bytes), ordered [blend][bone].
-		const size_t animStride = 12;
+		// mstudioanim_t: 6 offsets, ordered [blend][bone]; 16-bit (12-byte
+		// records) or 32-bit (24-byte records), see DetectAnimRecordStride.
+		bool hasStreams = true;
+		const size_t animStride = DetectAnimRecordStride(data, size,
+			static_cast<size_t>(localAnimIndex), seq.numblends, bones_.size(),
+			(seq.flags & 2) != 0, &hasStreams);
 		const size_t totalAnims =
 			static_cast<size_t>(seq.numblends) * bones_.size();
-		if (!InRange(static_cast<size_t>(localAnimIndex),
-			animStride * totalAnims, size))
+		if (animStride == 0 ||
+			!InRange(static_cast<size_t>(localAnimIndex), animStride * totalAnims, size))
 			return;
 
 		decoded.blends.resize(static_cast<size_t>(seq.numblends));
@@ -768,9 +840,19 @@ namespace cso_gui
 				BoneAnim &boneAnim = blendAnims[bone];
 				for (int axis = 0; axis < 6; ++axis)
 				{
-					std::uint16_t offset;
-					std::memcpy(&offset, data + record + static_cast<size_t>(axis) * 2,
-						sizeof(offset));
+					std::uint32_t offset;
+					if (animStride == 12)
+					{
+						std::uint16_t offset16;
+						std::memcpy(&offset16, data + record + static_cast<size_t>(axis) * 2,
+							sizeof(offset16));
+						offset = offset16;
+					}
+					else
+					{
+						std::memcpy(&offset, data + record + static_cast<size_t>(axis) * 4,
+							sizeof(offset));
+					}
 					if (offset == 0)
 						continue;
 
@@ -878,6 +960,7 @@ namespace cso_gui
 			seq.animindex = readInt(off + 124);
 			seq.motiontype = readInt(off + 68);
 			seq.motionbone = readInt(off + 72);
+			seq.flags = readInt(off + 36);
 			seq.externalGroup = groupNumber;
 			// Provisional guess; replaced below by looking at the data itself.
 			seq.uniformRotationScale = groupNumber >= kFirstUniformScaleGroup;
@@ -894,39 +977,32 @@ namespace cso_gui
 				: lowestPointer - static_cast<std::int64_t>(kFileHeaderBytes);
 
 		// The animation values of a sequence follow its record table
-		// (numblends * numbones * 12 bytes) directly. If they do not, the
+		// (numblends * numbones records) directly. If they do not, the
 		// file was made for a different skeleton -- e.g. "foo1.seq" of a
 		// model "foo1.mdl" sitting next to "foo.mdl" -- and applying it
 		// would just tear the model apart. Check the first sequence that
 		// has any animation data and reject the whole file on a mismatch.
+		// (Records are 12 bytes with 16-bit offsets or 24 bytes with 32-bit
+		// offsets, see DetectAnimRecordStride.)
 		for (const Sequence &seq : parsed)
 		{
 			if (seq.numblends <= 0 || seq.numframes <= 0 || seq.animindex <= 0)
 				continue;
 			const std::int64_t local = static_cast<std::int64_t>(seq.animindex) - bias;
-			const size_t recordBytes =
+			const size_t minRecordBytes =
 				static_cast<size_t>(seq.numblends) * bones_.size() * 12;
 			if (local < static_cast<std::int64_t>(kFileHeaderBytes) ||
-				!InRange(static_cast<size_t>(local), recordBytes, size))
+				!InRange(static_cast<size_t>(local), minRecordBytes, size))
 				throw std::runtime_error(
 					"seq: animation table out of range (different skeleton?)");
-			size_t lowestStream = std::numeric_limits<size_t>::max();
-			for (size_t r = 0; r < recordBytes / 12; ++r)
-			{
-				const size_t record = static_cast<size_t>(local) + r * 12;
-				for (size_t axis = 0; axis < 6; ++axis)
-				{
-					std::uint16_t offset;
-					std::memcpy(&offset, data + record + axis * 2, sizeof(offset));
-					if (offset != 0)
-						lowestStream = std::min(lowestStream, record + offset);
-				}
-			}
-			if (lowestStream == std::numeric_limits<size_t>::max())
-				continue;  // static pose only, says nothing about the skeleton
-			if (lowestStream != static_cast<size_t>(local) + recordBytes)
+			bool hasStreams = true;
+			const size_t stride = DetectAnimRecordStride(data, size, static_cast<size_t>(local),
+				seq.numblends, bones_.size(), (seq.flags & 2) != 0, &hasStreams);
+			if (stride == 0)
 				throw std::runtime_error(
 					"seq: animation layout does not match this model's skeleton");
+			if (!hasStreams)
+				continue;  // static pose only, says nothing about the skeleton
 			break;
 		}
 

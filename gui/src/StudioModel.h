@@ -131,6 +131,11 @@ namespace cso_gui
 			int animindex = 0;
 			int motiontype = 0;  // STUDIO_X/Y/Z bitmask of locked motion axes
 			int motionbone = 0;  // bone index whose motion is locked
+			// seqdesc flags (bit 0 looping). Bit 1 (value 2) marks sequences
+			// whose animation records use 32-bit stream offsets (see
+			// DecodeSequenceAnimation); it is only a hint, the layout is also
+			// recognised from the data.
+			int flags = 0;
 			// 0 = stored inside the .mdl itself; N > 0 = comes from the
 			// external CSO companion file "<model name>N.seq" (see
 			// AppendExternalSequences).
