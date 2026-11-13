@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "ByteCursor.h"
+#include "Bc7Decompress.h"
 #include "DxtDecompress.h"
 
 // Standard little-endian DDS layout: "DDS " magic + a fixed 124-byte
@@ -20,6 +21,15 @@ namespace
 	constexpr uint32_t kFourCcDxt1 = 0x31545844; // "DXT1"
 	constexpr uint32_t kFourCcDxt3 = 0x33545844; // "DXT3"
 	constexpr uint32_t kFourCcDxt5 = 0x35545844; // "DXT5"
+	constexpr uint32_t kFourCcDx10 = 0x30315844; // "DX10" -> 20-byte DDS_HEADER_DXT10 follows
+
+	// DXGI_FORMAT values that can appear in a DX10 extended header.
+	constexpr uint32_t kDxgiR8G8B8A8 = 28, kDxgiR8G8B8A8Srgb = 29;
+	constexpr uint32_t kDxgiBc1 = 71, kDxgiBc1Srgb = 72;
+	constexpr uint32_t kDxgiBc2 = 74, kDxgiBc2Srgb = 75;
+	constexpr uint32_t kDxgiBc3 = 77, kDxgiBc3Srgb = 78;
+	constexpr uint32_t kDxgiB8G8R8A8 = 87, kDxgiB8G8R8A8Srgb = 91;
+	constexpr uint32_t kDxgiBc7 = 98, kDxgiBc7Srgb = 99;
 
 	constexpr uint32_t kPfAlphaPixels = 0x00000001; // DDPF_ALPHAPIXELS
 	constexpr uint32_t kPfFourCc = 0x00000004;      // DDPF_FOURCC
@@ -157,11 +167,51 @@ QImage LoadDdsImage(const std::vector<uint8_t> &data)
 			const size_t needed = static_cast<size_t>((height + 3) / 4) * static_cast<size_t>((width + 3) / 4) * 16;
 			DecompressDXT5(cursor.Bytes(needed), width, height, image.bits());
 		}
+		else if (fourCc == kFourCcDx10)
+		{
+			// Extended header: dxgiFormat, resourceDimension, miscFlag, arraySize, miscFlags2.
+			const uint32_t dxgiFormat = cursor.U32();
+			cursor.Bytes(4 * 4);
+
+			const size_t blocks = static_cast<size_t>((height + 3) / 4) * static_cast<size_t>((width + 3) / 4);
+			switch (dxgiFormat)
+			{
+			case kDxgiBc1: case kDxgiBc1Srgb:
+				DecompressDXT1(cursor.Bytes(blocks * 8), width, height, image.bits());
+				break;
+			case kDxgiBc2: case kDxgiBc2Srgb:
+				DecompressDXT3(cursor.Bytes(blocks * 16), width, height, image.bits());
+				break;
+			case kDxgiBc3: case kDxgiBc3Srgb:
+				DecompressDXT5(cursor.Bytes(blocks * 16), width, height, image.bits());
+				break;
+			case kDxgiBc7: case kDxgiBc7Srgb:
+				DecompressBC7(cursor.Bytes(blocks * 16), width, height, image.bits());
+				break;
+			case kDxgiR8G8B8A8: case kDxgiR8G8B8A8Srgb:
+			case kDxgiB8G8R8A8: case kDxgiB8G8R8A8Srgb:
+			{
+				const bool bgra = dxgiFormat == kDxgiB8G8R8A8 || dxgiFormat == kDxgiB8G8R8A8Srgb;
+				const uint8_t *src = cursor.Bytes(static_cast<size_t>(width) * height * 4);
+				uint8_t *dst = image.bits();
+				for (size_t i = 0, n = static_cast<size_t>(width) * height; i < n; ++i)
+				{
+					dst[i * 4 + 0] = src[i * 4 + (bgra ? 2 : 0)];
+					dst[i * 4 + 1] = src[i * 4 + 1];
+					dst[i * 4 + 2] = src[i * 4 + (bgra ? 0 : 2)];
+					dst[i * 4 + 3] = src[i * 4 + 3];
+				}
+				break;
+			}
+			default:
+				throw std::runtime_error("unsupported DXGI format in DX10 DDS (supported: BC1/2/3/7, RGBA8, BGRA8)");
+			}
+		}
 		else
 		{
 			throw std::runtime_error(
-				"unsupported DDS compression (only DXT1/DXT3/DXT5 are supported; "
-				"BC4-7/ATI2 and DX10-extended-header DDS files are not)");
+				"unsupported DDS compression (supported: DXT1/DXT3/DXT5 and DX10 BC1/2/3/7; "
+				"BC4-6/ATI2 are not)");
 		}
 	}
 	else if ((pfFlags & (kPfRgb | kPfLuminance)) != 0)

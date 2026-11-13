@@ -13,8 +13,9 @@ namespace cso_gui
 	// Supports the block-compressed formats DXT1/DXT3/DXT5, and uncompressed
 	// RGB layouts (16/24/32 bits per pixel, whatever channel order the file's
 	// bitmasks describe -- covers the common BGRA8888/BGR888/RGB565 etc.
-	// variants). Anything else (BC4-7/ATI2, DX10 extended header, YUV, plain
-	// paletted, ...) throws std::runtime_error, same as an unsupported .cso
+	// variants). DX10-extended-header files are accepted for BC1/2/3/7 and
+	// RGBA8/BGRA8 (BC7 is what the 2026 CSO model textures use). Anything else
+	// (BC4-6/ATI2, YUV, plain paletted, ...) throws std::runtime_error, same as an unsupported .cso
 	// or .mdl does elsewhere in this app.
 	QImage LoadDdsImage(const std::vector<uint8_t> &data);
 }

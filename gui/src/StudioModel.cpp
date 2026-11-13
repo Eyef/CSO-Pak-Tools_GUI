@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
+#include "Bc7Decompress.h"
 #include "ModelCrypt.h"
 
 namespace cso_gui
@@ -17,6 +18,9 @@ namespace cso_gui
 		constexpr int kStudioVersionDecrypted = 9;  // ICE model after decryption
 		constexpr int kStudioVersion10 = 10;
 		constexpr int kStudioVersion11 = 11;
+		// 2026 CSO update: same header/bone/hitbox/sequence layout, new texture
+		// and geometry blocks (see ParseTextures2026 / ParseBodyParts2026).
+		constexpr int kStudioVersion2026 = 2026;
 
 		constexpr int kMaxBoneName = 32;
 		constexpr int kMaxTextureName = 64;
@@ -112,6 +116,7 @@ namespace cso_gui
 		textures_.clear();
 		sequences_.clear();
 		decodedSequences_.clear();
+		inverseRest_.clear();
 		skinRefs_.clear();
 		skinFamilyCount_ = 0;
 
@@ -152,7 +157,7 @@ namespace cso_gui
 		// 9 is what the decrypted form of an ICE model carries (see
 		// ModelCrypt); same layout as 10 for everything parsed here.
 		if (version_ != kStudioVersionDecrypted && version_ != kStudioVersion10 &&
-			version_ != kStudioVersion11)
+			version_ != kStudioVersion11 && version_ != kStudioVersion2026)
 			throw std::runtime_error("model: unsupported studio version " + std::to_string(version_));
 		if (encrypted_)
 			version_ = encryptedVersion;  // report what is on disk (20/21)
@@ -174,9 +179,18 @@ namespace cso_gui
 		h.seqIndex = Int(kOffSeqIndex);
 
 		ParseBones(h);
-		ParseTextures(h);
-		ParseSkins(h);
-		ParseBodyParts(h);
+		if (version_ == kStudioVersion2026)
+		{
+			ParseTextures2026(h);
+			ParseSkins(h);
+			ParseBodyParts2026(h);
+		}
+		else
+		{
+			ParseTextures(h);
+			ParseSkins(h);
+			ParseBodyParts(h);
+		}
 		ParseSequences(h);
 
 		// base_ pointed into the caller's byte vector (often a temporary
@@ -813,7 +827,7 @@ namespace cso_gui
 		// Fallback only (see the detection after decoding): files from this
 		// group on normally use radians * 10240 instead of the .mdl's per-bone
 		// scale.
-		constexpr int kFirstUniformScaleGroup = 3;
+		constexpr int kFirstUniformScaleGroup = 2;
 
 		const uint8_t *data = seqData.data();
 		const size_t size = seqData.size();
@@ -1325,6 +1339,264 @@ namespace cso_gui
 		}
 	}
 
+
+	namespace
+	{
+		// Rigid inverse of a bone world matrix (rotation block orthonormal,
+		// row-vector convention: p' = p * R + t).
+		Matrix4 InvertRigid(const Matrix4 &a)
+		{
+			Matrix4 out;
+			for (int r = 0; r < 3; ++r)
+				for (int c = 0; c < 3; ++c)
+					out.m[r * 4 + c] = a.m[c * 4 + r];
+			for (int c = 0; c < 3; ++c)
+				out.m[12 + c] = -(a.m[12] * out.m[0 * 4 + c] + a.m[13] * out.m[1 * 4 + c] +
+					a.m[14] * out.m[2 * 4 + c]);
+			out.m[15] = 1.0f;
+			return out;
+		}
+
+		Matrix4 ToMatrix4(const std::array<float, 16> &a)
+		{
+			Matrix4 out;
+			std::copy(a.begin(), a.end(), out.m);
+			return out;
+		}
+	}
+
+	// ---- Version 2026 ------------------------------------------------------
+	//
+	// Texture entry (96 bytes, at studiohdr.textureindex):
+	//   char name[64]; int flags; int ?(8); int width, height; int mipCount;
+	//   int dataIndex; int dataSize; int 0
+	// dataIndex points at a BC7 (BPTC) mip chain, mip 0 first, no DDS header,
+	// no palette. Only mip 0 is decoded.
+	void StudioModel::ParseTextures2026(const Header &h)
+	{
+		textures_.clear();
+		if (h.numTextures <= 0 || h.textureIndex <= 0)
+			return;
+
+		constexpr size_t kStride = 96;
+		if (!InRange(static_cast<size_t>(h.textureIndex),
+			kStride * static_cast<size_t>(h.numTextures), size_))
+			throw std::runtime_error("model: texture table out of range");
+
+		for (int i = 0; i < h.numTextures; ++i)
+		{
+			const int off = h.textureIndex + i * static_cast<int>(kStride);
+			Texture tex;
+			tex.name = ReadFixedString(Ptr(off), kMaxTextureName);
+			tex.flags = Int(off + 64);
+			tex.width = Int(off + 72);
+			tex.height = Int(off + 76);
+			const int index = Int(off + 84);
+
+			if (tex.width <= 0 || tex.height <= 0 || tex.width > 8192 || tex.height > 8192)
+				throw std::runtime_error("model: invalid texture dimensions");
+			const size_t mip0Bytes = static_cast<size_t>((tex.width + 3) / 4) *
+				static_cast<size_t>((tex.height + 3) / 4) * 16;
+			if (index <= 0 || !InRange(static_cast<size_t>(index), mip0Bytes, size_))
+				throw std::runtime_error("model: texture data out of range");
+
+			QImage image(tex.width, tex.height, QImage::Format_ARGB32);
+			std::vector<uint8_t> rgba(static_cast<size_t>(tex.width) * tex.height * 4);
+			DecompressBC7(Ptr(index), tex.width, tex.height, rgba.data());
+			uint32_t *dst = reinterpret_cast<uint32_t *>(image.bits());
+			for (size_t p = 0, n = static_cast<size_t>(tex.width) * tex.height; p < n; ++p)
+				dst[p] = (uint32_t(rgba[p * 4 + 3]) << 24) | (uint32_t(rgba[p * 4 + 0]) << 16) |
+					(uint32_t(rgba[p * 4 + 1]) << 8) | uint32_t(rgba[p * 4 + 2]);
+
+			tex.image = std::move(image);
+			textures_.push_back(std::move(tex));
+		}
+	}
+
+	// Geometry blocks of a version 2026 file (bodypart table is unchanged):
+	//   model, 76 bytes: char name[64]; float radius; int numMesh; int meshIndex
+	//   mesh,  32 bytes: int numVerts, vertIndex, numIndices, indexIndex,
+	//                    1 (unknown), auxIndex, 0, 0
+	//                    auxIndex -> int skinRef (index into the skin table), ...
+	//   vertex, 48 bytes: float pos[3], normal[3], uv[2];   (bind pose, model space;
+	//                     uv: v is NOT flipped, 0..1 over the texture)
+	//                     uint8 bone[4]; uint8 weight[4] (sum 255);
+	//                     int flag (0/1, meaning unknown); int 0
+	//   indices: uint32 triangle list, relative to the mesh's own vertices.
+	void StudioModel::ParseBodyParts2026(const Header &h)
+	{
+		bodyParts_.clear();
+		inverseRest_.clear();
+		if (h.numBodyParts <= 0 || h.bodyPartIndex <= 0)
+			return;
+
+		constexpr size_t kBodyPartStride = kMaxBodyPartName + 4 + 4 + 4;
+		constexpr size_t kModelStride = 76;
+		constexpr size_t kMeshStride = 32;
+		constexpr size_t kVertexStride = 48;
+		if (!InRange(static_cast<size_t>(h.bodyPartIndex),
+			kBodyPartStride * static_cast<size_t>(h.numBodyParts), size_))
+			throw std::runtime_error("model: bodypart table out of range");
+
+		// Rest-pose world matrix of every bone and its inverse; vertices are
+		// stored in bind space, skinning needs them in bone space.
+		std::vector<Matrix4> restWorld(bones_.size());
+		inverseRest_.resize(bones_.size());
+		for (size_t i = 0; i < bones_.size(); ++i)
+		{
+			const Matrix4 local = LocalBoneMatrix(bones_[i].position, bones_[i].rotation);
+			const int parent = bones_[i].parent;
+			restWorld[i] = (parent >= 0 && parent < static_cast<int>(i))
+				? Multiply(local, restWorld[static_cast<size_t>(parent)])
+				: local;
+			const Matrix4 inv = InvertRigid(restWorld[i]);
+			std::copy(inv.m, inv.m + 16, inverseRest_[i].begin());
+		}
+
+		const auto textureForSkin = [&](int skinRef) -> const Texture *
+		{
+			if (skinRef < 0 || skinRef >= static_cast<int>(skinRefs_.size()))
+				return nullptr;
+			const int tex = skinRefs_[static_cast<size_t>(skinRef)];
+			if (tex < 0 || tex >= static_cast<int>(textures_.size()))
+				return nullptr;
+			return &textures_[static_cast<size_t>(tex)];
+		};
+
+		for (int bp = 0; bp < h.numBodyParts; ++bp)
+		{
+			const int off = h.bodyPartIndex + bp * static_cast<int>(kBodyPartStride);
+			BodyPart part;
+			part.name = ReadFixedString(Ptr(off), kMaxBodyPartName);
+			const int numModels = Int(off + kMaxBodyPartName);
+			part.base = std::max(Int(off + kMaxBodyPartName + 4), 1);
+			const int modelIndex = Int(off + kMaxBodyPartName + 8);
+
+			if (numModels <= 0 || modelIndex <= 0)
+			{
+				bodyParts_.push_back(std::move(part));
+				continue;
+			}
+			if (!InRange(static_cast<size_t>(modelIndex),
+				kModelStride * static_cast<size_t>(numModels), size_))
+				throw std::runtime_error("model: submodel table out of range");
+
+			for (int mi = 0; mi < numModels; ++mi)
+			{
+				const int moff = modelIndex + mi * static_cast<int>(kModelStride);
+				SubModel sub;
+				sub.name = ReadFixedString(Ptr(moff), kMaxSubModelName);
+				const int numMesh = Int(moff + 68);
+				const int meshIndex = Int(moff + 72);
+
+				if (numMesh > 0 && meshIndex > 0)
+				{
+					if (!InRange(static_cast<size_t>(meshIndex),
+						kMeshStride * static_cast<size_t>(numMesh), size_))
+						throw std::runtime_error("model: mesh table out of range");
+
+					for (int q = 0; q < numMesh; ++q)
+					{
+						const int me = meshIndex + q * static_cast<int>(kMeshStride);
+						const int numVerts = Int(me);
+						const int vertIndex = Int(me + 4);
+						const int numIndices = Int(me + 8);
+						const int indexIndex = Int(me + 12);
+
+						Mesh mesh;
+						// The texture reference is the first int of the mesh's aux
+						// block (auxIndex): 0 for the body, 1 for the backpack, 2
+						// for the cap in buffclass26s4tr.mdl. The int at +16 is 1 for
+						// every mesh seen so far and is NOT the skin reference.
+						const int auxIndex = Int(me + 20);
+						mesh.skinref = (auxIndex > 0 && InRange(static_cast<size_t>(auxIndex), 4, size_))
+							? Int(auxIndex) : 0;
+						if (numVerts <= 0 || numIndices < 3 || vertIndex <= 0 || indexIndex <= 0)
+						{
+							sub.meshes.push_back(std::move(mesh));
+							continue;
+						}
+						if (!InRange(static_cast<size_t>(vertIndex),
+							kVertexStride * static_cast<size_t>(numVerts), size_) ||
+							!InRange(static_cast<size_t>(indexIndex),
+								sizeof(uint32_t) * static_cast<size_t>(numIndices), size_))
+							throw std::runtime_error("model: mesh geometry out of range");
+
+						const Texture *tex = textureForSkin(mesh.skinref);
+						const float texW = tex ? static_cast<float>(tex->width) : 256.0f;
+						const float texH = tex ? static_cast<float>(tex->height) : 256.0f;
+
+						// Per-vertex UVs of this mesh (texel units, like the old format).
+						std::vector<float> us(static_cast<size_t>(numVerts));
+						std::vector<float> vs(static_cast<size_t>(numVerts));
+						const size_t baseVert = sub.rawVerts.size();
+						for (int i = 0; i < numVerts; ++i)
+						{
+							const int v = vertIndex + i * static_cast<int>(kVertexStride);
+							sub.rawVerts.push_back({ Float(v), Float(v + 4), Float(v + 8) });
+							sub.rawNorms.push_back({ Float(v + 12), Float(v + 16), Float(v + 20) });
+							us[static_cast<size_t>(i)] = Float(v + 24) * texW;
+							vs[static_cast<size_t>(i)] = Float(v + 28) * texH;
+
+							VertexWeights vw;
+							int sum = 0;
+							for (int k = 0; k < 4; ++k)
+							{
+								vw.bones[static_cast<size_t>(k)] = base_[v + 32 + k];
+								sum += base_[v + 36 + k];
+							}
+							for (int k = 0; k < 4; ++k)
+								vw.weights[static_cast<size_t>(k)] = sum > 0
+									? static_cast<float>(base_[v + 36 + k]) / static_cast<float>(sum)
+									: (k == 0 ? 1.0f : 0.0f);
+							sub.vertWeights.push_back(vw);
+						}
+
+						const int numTris = numIndices / 3;
+						mesh.triangles.reserve(static_cast<size_t>(numTris));
+						for (int t = 0; t < numTris; ++t)
+						{
+							uint32_t idx[3];
+							std::memcpy(idx, base_ + indexIndex + static_cast<size_t>(t) * 12, sizeof(idx));
+							if (idx[0] >= static_cast<uint32_t>(numVerts) ||
+								idx[1] >= static_cast<uint32_t>(numVerts) ||
+								idx[2] >= static_cast<uint32_t>(numVerts))
+								continue;  // corrupt index: skip the triangle
+
+							Triangle tri;
+							const int g[3] = {
+								static_cast<int>(baseVert + idx[0]),
+								static_cast<int>(baseVert + idx[1]),
+								static_cast<int>(baseVert + idx[2]) };
+							tri.a = sub.rawVerts[static_cast<size_t>(g[0])];
+							tri.b = sub.rawVerts[static_cast<size_t>(g[1])];
+							tri.c = sub.rawVerts[static_cast<size_t>(g[2])];
+							tri.na = sub.rawNorms[static_cast<size_t>(g[0])];
+							tri.nb = sub.rawNorms[static_cast<size_t>(g[1])];
+							tri.nc = sub.rawNorms[static_cast<size_t>(g[2])];
+							tri.sa = us[idx[0]]; tri.ta = vs[idx[0]];
+							tri.sb = us[idx[1]]; tri.tb = vs[idx[1]];
+							tri.sc = us[idx[2]]; tri.tc = vs[idx[2]];
+							tri.texture = mesh.skinref;
+							tri.vertA = g[0]; tri.vertB = g[1]; tri.vertC = g[2];
+							tri.normA = g[0]; tri.normB = g[1]; tri.normC = g[2];
+							// Dominant bone only for the legacy fields; the real
+							// (weighted) skinning happens in ApplyFrame.
+							tri.boneA = sub.vertWeights[static_cast<size_t>(g[0])].bones[0];
+							tri.boneB = sub.vertWeights[static_cast<size_t>(g[1])].bones[0];
+							tri.boneC = sub.vertWeights[static_cast<size_t>(g[2])].bones[0];
+							tri.normBoneA = tri.boneA; tri.normBoneB = tri.boneB; tri.normBoneC = tri.boneC;
+							mesh.triangles.push_back(tri);
+						}
+						sub.meshes.push_back(std::move(mesh));
+					}
+				}
+				part.models.push_back(std::move(sub));
+			}
+			bodyParts_.push_back(std::move(part));
+		}
+	}
+
 	void StudioModel::SetBlending(int index, float value)
 	{
 		if (index >= 0 && index < 2)
@@ -1541,10 +1813,67 @@ namespace cso_gui
 		// local position was already zeroed above during pose construction.
 		(void)haveSequence;
 
+		// Version 2026: bind-space vertices with up to four weighted bones.
+		// skin[i] takes a bind-space point into bone i's current pose.
+		std::vector<Matrix4> skin;
+		if (inverseRest_.size() == bones_.size())
+		{
+			skin.resize(bones_.size());
+			for (size_t i = 0; i < bones_.size(); ++i)
+				skin[i] = Multiply(ToMatrix4(inverseRest_[i]), worldBones[i]);
+		}
+
 		// Re-skin every triangle.
 		for (auto &bp : bodyParts_)
 			for (auto &sub : bp.models)
 			{
+				if (!sub.vertWeights.empty() && sub.vertWeights.size() == sub.rawVerts.size() &&
+					!skin.empty())
+				{
+					std::vector<Vec3> pos(sub.rawVerts.size());
+					std::vector<Vec3> nrm(sub.rawVerts.size());
+					for (size_t v = 0; v < pos.size(); ++v)
+					{
+						const VertexWeights &vw = sub.vertWeights[v];
+						Vec3 p, n;
+						float used = 0.0f;
+						for (size_t k = 0; k < 4; ++k)
+						{
+							if (vw.weights[k] <= 0.0f || vw.bones[k] >= skin.size())
+								continue;
+							const Matrix4 &m = skin[vw.bones[k]];
+							p = p + TransformPoint(sub.rawVerts[v], m) * vw.weights[k];
+							n = n + TransformDirection(sub.rawNorms[v], m) * vw.weights[k];
+							used += vw.weights[k];
+						}
+						if (used <= 0.0f)
+						{
+							p = sub.rawVerts[v];
+							n = sub.rawNorms[v];
+						}
+						else if (used < 0.999f)
+						{
+							p = p * (1.0f / used);
+							n = n * (1.0f / used);
+						}
+						const float len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+						if (len > 1e-6f)
+							n = n * (1.0f / len);
+						pos[v] = p;
+						nrm[v] = n;
+					}
+					for (auto &mesh : sub.meshes)
+						for (auto &tri : mesh.triangles)
+						{
+							tri.a = pos[static_cast<size_t>(tri.vertA)];
+							tri.b = pos[static_cast<size_t>(tri.vertB)];
+							tri.c = pos[static_cast<size_t>(tri.vertC)];
+							tri.na = nrm[static_cast<size_t>(tri.normA)];
+							tri.nb = nrm[static_cast<size_t>(tri.normB)];
+							tri.nc = nrm[static_cast<size_t>(tri.normC)];
+						}
+					continue;
+				}
 				if (sub.rawVerts.empty() || sub.vertBones.empty())
 					continue;
 				for (auto &mesh : sub.meshes)

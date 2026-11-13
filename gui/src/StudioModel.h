@@ -14,6 +14,11 @@ namespace cso_gui
 	// CSO models (versions 20/21, decrypted on the fly) and their decrypted
 	// form (version 9). All share the same binary layout for everything this
 	// parser uses.
+	//
+	// Also reads the newer "version 2026" files (CSO 2026 update): same
+	// header/bone/hitbox/sequence layout, but BC7-compressed DDS textures,
+	// indexed triangle lists instead of strips and vertices that carry up to
+	// four bone weights (see ParseBodyParts2026).
 	class StudioModel
 	{
 	public:
@@ -77,6 +82,13 @@ namespace cso_gui
 			int skinref = 0;
 		};
 
+		// Up to four bone influences of one vertex (weights sum to 1).
+		struct VertexWeights
+		{
+			std::array<std::uint8_t, 4> bones{};
+			std::array<float, 4> weights{};
+		};
+
 		struct SubModel
 		{
 			std::string name;
@@ -87,6 +99,11 @@ namespace cso_gui
 			std::vector<int> vertBones;
 			std::vector<Vec3> rawNorms;
 			std::vector<int> normBones;
+			// Version 2026 only: per-vertex blend weights (parallel to
+			// rawVerts; rawVerts/rawNorms are then in model space of the bind
+			// pose and every normal index equals its vertex index). Empty for
+			// the classic one-bone-per-vertex files.
+			std::vector<VertexWeights> vertWeights;
 		};
 
 		struct BodyPart
@@ -237,6 +254,10 @@ namespace cso_gui
 		std::vector<Texture> textures_;
 		std::vector<Sequence> sequences_;
 		std::vector<DecodedSequence> decodedSequences_;
+		// Version 2026: inverse of every bone's rest-pose world matrix
+		// (rigid, 16 floats each, same layout as the internal Matrix4), used
+		// to turn bind-space vertices into bone-local ones when skinning.
+		std::vector<std::array<float, 16>> inverseRest_;
 
 		float blending_[2] = { 127.5f, 127.5f };
 		int skinFamilyCount_ = 0;
@@ -251,6 +272,8 @@ namespace cso_gui
 		void ParseTextures(const Header &h);
 		void ParseSkins(const Header &h);
 		void ParseBodyParts(const Header &h);
+		void ParseTextures2026(const Header &h);
+		void ParseBodyParts2026(const Header &h);
 		void ParseSequences(const Header &h);
 		// Decodes sequences_[sequenceIndex] from `data`. `bias` converts the
 		// sequence's animindex into an offset inside `data` (0 for the .mdl
