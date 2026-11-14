@@ -16,9 +16,9 @@ namespace cso_gui
 	// parser uses.
 	//
 	// Also reads the newer "version 2026" files (CSO 2026 update): same
-	// header/bone/hitbox/sequence layout, but BC7-compressed DDS textures,
-	// indexed triangle lists instead of strips and vertices that carry up to
-	// four bone weights (see ParseBodyParts2026).
+	// header/bone/hitbox/sequence layout, but BC7-compressed textures, indexed
+	// triangle lists instead of strips and vertices that carry up to four bone
+	// weights (see ParseBodyParts2026).
 	class StudioModel
 	{
 	public:
@@ -104,6 +104,8 @@ namespace cso_gui
 			// pose and every normal index equals its vertex index). Empty for
 			// the classic one-bone-per-vertex files.
 			std::vector<VertexWeights> vertWeights;
+			// Bounding radius stored in the model record (0 when unknown).
+			float radius = 0.0f;
 		};
 
 		struct BodyPart
@@ -131,10 +133,10 @@ namespace cso_gui
 			int animindex = 0;
 			int motiontype = 0;  // STUDIO_X/Y/Z bitmask of locked motion axes
 			int motionbone = 0;  // bone index whose motion is locked
-			// seqdesc flags (bit 0 looping). Bit 1 (value 2) marks sequences
-			// whose animation records use 32-bit stream offsets (see
-			// DecodeSequenceAnimation); it is only a hint, the layout is also
-			// recognised from the data.
+			// seqdesc flags (bit 0 = looping). Bit 1 (value 2) marks
+			// sequences whose animation records use 32-bit stream offsets
+			// (see Sequence::animStride); it is only a hint -- the layout is
+			// decided from the data, because one .seq can mix both.
 			int flags = 0;
 			// 0 = stored inside the .mdl itself; N > 0 = comes from the
 			// external CSO companion file "<model name>N.seq" (see
@@ -156,6 +158,12 @@ namespace cso_gui
 			// Non-zero = per-bone scales for that bone index. Empty in the
 			// usual case.
 			std::vector<std::uint8_t> mdlScaledBones;
+			// Bytes per mstudioanim_t record in the animation table:
+			// 12 = six uint16 stream offsets (every file up to now),
+			// 24 = six uint32 offsets (2026 files; they mix both strides
+			// inside one .seq, so this is detected per sequence from the
+			// data rather than from the group or the file).
+			int animStride = 12;
 		};
 
 		// Raw sequence from the file for one (bone, axis) channel. Each entry is
@@ -191,6 +199,10 @@ namespace cso_gui
 		const std::vector<Bone> &Bones() const { return bones_; }
 		const std::vector<BodyPart> &BodyParts() const { return bodyParts_; }
 		const std::vector<Texture> &Textures() const { return textures_; }
+		// Version 2026: inverse of every bone's rest-pose world matrix (rigid,
+		// 16 floats each, row-vector convention, translation in m[12..14]).
+		// Empty for classic models.
+		const std::vector<std::array<float, 16>> &RestInverseMatrices() const { return inverseRest_; }
 		const std::vector<Sequence> &Sequences() const { return sequences_; }
 
 		// Decoded per-sequence animation (empty if a sequence has none).

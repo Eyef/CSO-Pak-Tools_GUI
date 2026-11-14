@@ -62,73 +62,138 @@ namespace cso_gui
 		{
 			return offset <= total && count <= total - offset;
 		}
-		// Size of one per-bone animation record (mstudioanim_t) of a
-		// sequence whose record table starts at `local`:
-		//  * 12 bytes: 6 x uint16 stream offsets (pos xyz, rot xyz) -- every
-		//    older file and most 2026 ones;
-		//  * 24 bytes: 6 x uint32 offsets, used by 2026 sequences whose
-		//    packed streams exceed 64 KB (e.g. the long emotion01..04 of
-		//    buffclass26s4tr3.seq; those seqdescs carry flag 2).
-		// In both cases the record table is followed directly by the streams,
-		// which identifies the layout. Returns 0 when neither fits (animation
-		// made for another skeleton); *hasStreams is false for a static pose
-		// (no offsets at all), where `preferWide` decides.
-		size_t DetectAnimRecordStride(const uint8_t *data, size_t size, size_t local,
-			int numBlends, size_t numBones, bool preferWide, bool *hasStreams)
+
+		// mstudioanim_t record layouts. Classic: six uint16 stream offsets.
+		// 2026 update: six uint32 offsets. The stride is a per-sequence
+		// property -- a 2026 .seq can hold 24-byte and 12-byte sequences --
+		// so it is detected from the data, never assumed from the group.
+		constexpr size_t kAnimStrideShort = 12;
+		constexpr size_t kAnimStrideLong = 24;
+
+		std::uint32_t AnimRecordOffset(const uint8_t *data, size_t record,
+			size_t stride, size_t axis)
 		{
-			const size_t count = static_cast<size_t>(numBlends) * numBones;
-			const size_t order[2] = { preferWide ? size_t(24) : size_t(12),
-				preferWide ? size_t(12) : size_t(24) };
-			*hasStreams = true;
-			bool staticPose = false;
-			size_t staticStride = 0;
-			for (const size_t stride : order)
+			if (stride == kAnimStrideLong)
 			{
-				if (!InRange(local, stride * count, size))
-					continue;
-				size_t lowest = std::numeric_limits<size_t>::max();
-				for (size_t r = 0; r < count; ++r)
-				{
-					const size_t record = local + r * stride;
-					for (size_t axis = 0; axis < 6; ++axis)
-					{
-						size_t offset;
-						if (stride == 12)
-						{
-							std::uint16_t v;
-							std::memcpy(&v, data + record + axis * 2, sizeof(v));
-							offset = v;
-						}
-						else
-						{
-							std::uint32_t v;
-							std::memcpy(&v, data + record + axis * 4, sizeof(v));
-							offset = v;
-						}
-						if (offset != 0)
-							lowest = std::min(lowest, record + offset);
-					}
-				}
-				if (lowest == std::numeric_limits<size_t>::max())
-				{
-					if (!staticPose)
-					{
-						staticPose = true;
-						staticStride = stride;
-					}
-					continue;
-				}
-				if (lowest == local + stride * count)
-					return stride;
+				std::uint32_t offset;
+				std::memcpy(&offset, data + record + axis * 4, sizeof(offset));
+				return offset;
 			}
-			if (staticPose)
-			{
-				*hasStreams = false;
-				return staticStride;
-			}
-			return 0;
+			std::uint16_t offset;
+			std::memcpy(&offset, data + record + axis * 2, sizeof(offset));
+			return offset;
 		}
 
+		// True when every non-empty channel stream of the
+		// numblends * numBones records at localAnimIndex decodes to at
+		// least numframes frames and stays inside `size`.
+		bool AnimTableFits(const uint8_t *data, size_t size, size_t localAnimIndex,
+			int numblends, int numframes, size_t numBones, size_t stride)
+		{
+			const size_t totalRecords = static_cast<size_t>(numblends) * numBones;
+			if (totalRecords > size / stride ||
+				!InRange(localAnimIndex, totalRecords * stride, size))
+				return false;
+			for (size_t r = 0; r < totalRecords; ++r)
+			{
+				const size_t record = localAnimIndex + r * stride;
+				for (size_t axis = 0; axis < 6; ++axis)
+				{
+					const std::uint32_t offset =
+						AnimRecordOffset(data, record, stride, axis);
+					if (offset == 0)
+						continue;
+					size_t pos = record + offset;
+					int covered = 0;
+					while (covered < numframes)
+					{
+						if (!InRange(pos, 2, size))
+							return false;
+						const std::uint8_t valid = data[pos];
+						const std::uint8_t total = data[pos + 1];
+						if (total == 0)
+							return false;
+						covered += total;
+						pos += 2 + static_cast<size_t>(valid) * 2;
+					}
+					if (pos > size)
+						return false;  // last span's values run past EOF
+				}
+			}
+			return true;
+		}
+
+		// True when at least one channel of the table has a stream. A fully
+		// static table (all offsets zero) decodes the same for any skeleton,
+		// so it says nothing about whether the file belongs to this model.
+		bool AnimTableHasStreams(const uint8_t *data, size_t size,
+			size_t localAnimIndex, int numblends, size_t numBones, size_t stride)
+		{
+			const size_t totalRecords = static_cast<size_t>(numblends) * numBones;
+			if (totalRecords > size / stride ||
+				!InRange(localAnimIndex, totalRecords * stride, size))
+				return false;
+			for (size_t r = 0; r < totalRecords; ++r)
+			{
+				const size_t record = localAnimIndex + r * stride;
+				for (size_t axis = 0; axis < 6; ++axis)
+					if (AnimRecordOffset(data, record, stride, axis) != 0)
+						return true;
+			}
+			return false;
+		}
+
+		// Record stride of one sequence: the classic 12-byte layout is tried
+		// first, then the 24-byte one (a seqdesc with flag 2, the 2026 marker
+		// for 32-bit offsets, makes the wide layout go first). A layout counts
+		// only when the streams start right after its record table -- with the
+		// wrong stride the offsets point into unrelated bytes and that never
+		// lines up -- and when every channel decodes to numframes frames.
+		// Returns 0 when neither fits (file made for another skeleton), 12
+		// when the sequence has no animation data at all (a static pose reads
+		// the same with either stride).
+		size_t DetectAnimStride(const uint8_t *data, size_t size,
+			size_t localAnimIndex, int numblends, int numframes, size_t numBones,
+			bool preferWide = false)
+		{
+			if (data == nullptr || numblends <= 0 || numframes <= 0 || numBones == 0)
+				return kAnimStrideShort;
+
+			const size_t totalRecords = static_cast<size_t>(numblends) * numBones;
+			const size_t order[2] = { preferWide ? kAnimStrideLong : kAnimStrideShort,
+				preferWide ? kAnimStrideShort : kAnimStrideLong };
+			bool staticPose = false;
+			for (const size_t stride : order)
+			{
+				if (totalRecords > size / stride ||
+					!InRange(localAnimIndex, totalRecords * stride, size))
+					continue;
+
+				size_t lowestStream = std::numeric_limits<size_t>::max();
+				for (size_t r = 0; r < totalRecords; ++r)
+				{
+					const size_t record = localAnimIndex + r * stride;
+					for (size_t axis = 0; axis < 6; ++axis)
+					{
+						const std::uint32_t offset =
+							AnimRecordOffset(data, record, stride, axis);
+						if (offset != 0)
+							lowestStream = std::min(lowestStream, record + offset);
+					}
+				}
+				if (lowestStream == std::numeric_limits<size_t>::max())
+				{
+					staticPose = true;  // no streams: says nothing about the stride
+					continue;
+				}
+				if (lowestStream != localAnimIndex + totalRecords * stride)
+					continue;
+				if (AnimTableFits(data, size, localAnimIndex, numblends,
+					numframes, numBones, stride))
+					return stride;
+			}
+			return staticPose ? kAnimStrideShort : 0;
+		}
 	}
 
 	struct StudioModel::Header
@@ -532,6 +597,7 @@ namespace cso_gui
 				const int moff = modelIndex + mi * static_cast<int>(modelStride);
 				SubModel sub;
 				sub.name = ReadFixedString(Ptr(moff), kMaxSubModelName);
+				sub.radius = Float(moff + 68);
 				const int numMesh = Int(moff + 72);
 				const int meshIndex = Int(moff + 76);
 				const int numVerts = Int(moff + 80);
@@ -793,10 +859,24 @@ namespace cso_gui
 			sequences_.push_back(std::move(seq));
 		}
 
-		// Decode each sequence's animation keyframes into usable form.
+		// Decode each sequence's animation keyframes into usable form. The
+		// record stride is detected per sequence (see DetectAnimStride): the
+		// 2026 files mix 24-byte and 12-byte records, all older ones use 12.
 		decodedSequences_.resize(sequences_.size());
 		for (size_t i = 0; i < sequences_.size(); ++i)
+		{
+			Sequence &seq = sequences_[i];
+			if (base_ != nullptr && seq.numblends > 0 && seq.numframes > 0 &&
+				seq.animindex > 0 && !bones_.empty())
+			{
+				const size_t stride = DetectAnimStride(base_, size_,
+					static_cast<size_t>(seq.animindex), seq.numblends,
+					seq.numframes, bones_.size(), (seq.flags & 2) != 0);
+				if (stride != 0)
+					seq.animStride = static_cast<int>(stride);
+			}
 			DecodeSequenceAnimation(i, base_, size_, 0);
+		}
 	}
 
 	void StudioModel::DecodeSequenceAnimation(size_t sequenceIndex, const uint8_t *data,
@@ -814,16 +894,17 @@ namespace cso_gui
 		if (localAnimIndex < 0)
 			return;
 
-		// mstudioanim_t: 6 offsets, ordered [blend][bone]; 16-bit (12-byte
-		// records) or 32-bit (24-byte records), see DetectAnimRecordStride.
-		bool hasStreams = true;
-		const size_t animStride = DetectAnimRecordStride(data, size,
-			static_cast<size_t>(localAnimIndex), seq.numblends, bones_.size(),
-			(seq.flags & 2) != 0, &hasStreams);
+		// mstudioanim_t: six stream offsets, ordered [blend][bone]. 12 bytes
+		// (uint16) normally, 24 bytes (uint32) in the 2026 files; see
+		// Sequence::animStride.
+		const size_t animStride =
+			seq.animStride == static_cast<int>(kAnimStrideLong)
+				? kAnimStrideLong
+				: kAnimStrideShort;
 		const size_t totalAnims =
 			static_cast<size_t>(seq.numblends) * bones_.size();
-		if (animStride == 0 ||
-			!InRange(static_cast<size_t>(localAnimIndex), animStride * totalAnims, size))
+		if (!InRange(static_cast<size_t>(localAnimIndex),
+			animStride * totalAnims, size))
 			return;
 
 		decoded.blends.resize(static_cast<size_t>(seq.numblends));
@@ -840,19 +921,8 @@ namespace cso_gui
 				BoneAnim &boneAnim = blendAnims[bone];
 				for (int axis = 0; axis < 6; ++axis)
 				{
-					std::uint32_t offset;
-					if (animStride == 12)
-					{
-						std::uint16_t offset16;
-						std::memcpy(&offset16, data + record + static_cast<size_t>(axis) * 2,
-							sizeof(offset16));
-						offset = offset16;
-					}
-					else
-					{
-						std::memcpy(&offset, data + record + static_cast<size_t>(axis) * 4,
-							sizeof(offset));
-					}
+					const std::uint32_t offset = AnimRecordOffset(
+						data, record, animStride, static_cast<size_t>(axis));
 					if (offset == 0)
 						continue;
 
@@ -909,7 +979,7 @@ namespace cso_gui
 		// Fallback only (see the detection after decoding): files from this
 		// group on normally use radians * 10240 instead of the .mdl's per-bone
 		// scale.
-		constexpr int kFirstUniformScaleGroup = 2;
+		constexpr int kFirstUniformScaleGroup = 3;
 
 		const uint8_t *data = seqData.data();
 		const size_t size = seqData.size();
@@ -977,34 +1047,55 @@ namespace cso_gui
 				: lowestPointer - static_cast<std::int64_t>(kFileHeaderBytes);
 
 		// The animation values of a sequence follow its record table
-		// (numblends * numbones records) directly. If they do not, the
-		// file was made for a different skeleton -- e.g. "foo1.seq" of a
-		// model "foo1.mdl" sitting next to "foo.mdl" -- and applying it
-		// would just tear the model apart. Check the first sequence that
-		// has any animation data and reject the whole file on a mismatch.
-		// (Records are 12 bytes with 16-bit offsets or 24 bytes with 32-bit
-		// offsets, see DetectAnimRecordStride.)
-		for (const Sequence &seq : parsed)
+		// (numblends * numbones * record bytes) directly. The record is 12
+		// bytes (six uint16 offsets) in every pre-2026 file, but the 2026
+		// update mixes 24-byte records (six uint32 offsets) into files whose
+		// other sequences stay classic, so the stride is detected per
+		// sequence. If nothing in the file validates, it was made for a
+		// different skeleton -- e.g. "foo1.seq" of a model "foo1.mdl" sitting
+		// next to "foo.mdl" -- and applying it would tear the model apart.
+		bool sawUnmatched = false;  // animated sequence whose layout fails
+		bool anyMatched = false;
+		size_t fileStride = kAnimStrideShort;
+		std::vector<size_t> unresolvedStride;
+		for (size_t i = 0; i < parsed.size(); ++i)
 		{
+			Sequence &seq = parsed[i];
 			if (seq.numblends <= 0 || seq.numframes <= 0 || seq.animindex <= 0)
 				continue;
 			const std::int64_t local = static_cast<std::int64_t>(seq.animindex) - bias;
-			const size_t minRecordBytes =
-				static_cast<size_t>(seq.numblends) * bones_.size() * 12;
-			if (local < static_cast<std::int64_t>(kFileHeaderBytes) ||
-				!InRange(static_cast<size_t>(local), minRecordBytes, size))
-				throw std::runtime_error(
-					"seq: animation table out of range (different skeleton?)");
-			bool hasStreams = true;
-			const size_t stride = DetectAnimRecordStride(data, size, static_cast<size_t>(local),
-				seq.numblends, bones_.size(), (seq.flags & 2) != 0, &hasStreams);
+			if (local < static_cast<std::int64_t>(kFileHeaderBytes))
+			{
+				unresolvedStride.push_back(i);
+				sawUnmatched = true;
+				continue;
+			}
+			const size_t stride = DetectAnimStride(data, size,
+				static_cast<size_t>(local), seq.numblends, seq.numframes,
+				bones_.size(), (seq.flags & 2) != 0);
 			if (stride == 0)
-				throw std::runtime_error(
-					"seq: animation layout does not match this model's skeleton");
-			if (!hasStreams)
-				continue;  // static pose only, says nothing about the skeleton
-			break;
+			{
+				unresolvedStride.push_back(i);
+				sawUnmatched = true;
+				continue;
+			}
+			seq.animStride = static_cast<int>(stride);
+			// A static sequence fits any skeleton; only one that actually
+			// stores streams can confirm that the file belongs to this model.
+			if (!AnimTableHasStreams(data, size, static_cast<size_t>(local),
+				seq.numblends, bones_.size(), stride))
+				continue;
+			if (!anyMatched)
+				fileStride = stride;
+			anyMatched = true;
 		}
+		if (sawUnmatched && !anyMatched)
+			throw std::runtime_error(
+				"seq: animation layout does not match this model's skeleton");
+		// Sequences whose layout could not be confirmed keep the file's
+		// layout: it is the closest guess and decodes at worst as before.
+		for (const size_t i : unresolvedStride)
+			parsed[i].animStride = static_cast<int>(fileStride);
 
 		const size_t firstNew = sequences_.size();
 		decodedSequences_.resize(sequences_.size());
@@ -1415,7 +1506,6 @@ namespace cso_gui
 		}
 	}
 
-
 	namespace
 	{
 		// Rigid inverse of a bone world matrix (rotation block orthonormal,
@@ -1444,10 +1534,12 @@ namespace cso_gui
 	// ---- Version 2026 ------------------------------------------------------
 	//
 	// Texture entry (96 bytes, at studiohdr.textureindex):
-	//   char name[64]; int flags; int ?(8); int width, height; int mipCount;
+	//   char name[64]; int flags; int format; int width, height; int mipCount;
 	//   int dataIndex; int dataSize; int 0
-	// dataIndex points at a BC7 (BPTC) mip chain, mip 0 first, no DDS header,
-	// no palette. Only mip 0 is decoded.
+	// format 8 = BC7 (BPTC): dataIndex points at the mip chain, mip 0 first, no
+	// DDS header, no palette. Only mip 0 is decoded. No other format code has
+	// been seen; anything else gets a magenta placeholder so the rest of the
+	// model still opens.
 	void StudioModel::ParseTextures2026(const Header &h)
 	{
 		textures_.clear();
@@ -1465,12 +1557,23 @@ namespace cso_gui
 			Texture tex;
 			tex.name = ReadFixedString(Ptr(off), kMaxTextureName);
 			tex.flags = Int(off + 64);
+			const int format = Int(off + 68);
 			tex.width = Int(off + 72);
 			tex.height = Int(off + 76);
 			const int index = Int(off + 84);
 
 			if (tex.width <= 0 || tex.height <= 0 || tex.width > 8192 || tex.height > 8192)
 				throw std::runtime_error("model: invalid texture dimensions");
+			if (format != 8)
+			{
+				QImage placeholder(tex.width, tex.height, QImage::Format_ARGB32);
+				uint32_t *px = reinterpret_cast<uint32_t *>(placeholder.bits());
+				for (size_t p = 0, n = static_cast<size_t>(tex.width) * tex.height; p < n; ++p)
+					px[p] = 0xFFFF00FFu;
+				tex.image = std::move(placeholder);
+				textures_.push_back(std::move(tex));
+				continue;
+			}
 			const size_t mip0Bytes = static_cast<size_t>((tex.width + 3) / 4) *
 				static_cast<size_t>((tex.height + 3) / 4) * 16;
 			if (index <= 0 || !InRange(static_cast<size_t>(index), mip0Bytes, size_))
@@ -1492,10 +1595,16 @@ namespace cso_gui
 	// Geometry blocks of a version 2026 file (bodypart table is unchanged):
 	//   model, 76 bytes: char name[64]; float radius; int numMesh; int meshIndex
 	//   mesh,  32 bytes: int numVerts, vertIndex, numIndices, indexIndex,
-	//                    1 (unknown), auxIndex, 0, 0
-	//                    auxIndex -> int skinRef (index into the skin table), ...
-	//   vertex, 48 bytes: float pos[3], normal[3], uv[2];   (bind pose, model space;
-	//                     uv: v is NOT flipped, 0..1 over the texture)
+	//                    numSubMesh, subMeshIndex, 0, 0
+	//   submesh: int skinRef (index into the skin table), firstIndex, indexCount
+	//            -- ranges of the mesh's index list, each drawn with its own
+	//            texture. 12-byte entries in all files seen (always one
+	//            submesh so far); another published converter assumes 16, so
+	//            both strides are tried and the one whose ranges tile the
+	//            index list wins (see the loop below). One Mesh per submesh.
+	//   vertex, 48 bytes: float pos[3], normal[3], uv[2];   (bind pose, model
+	//                     space; uv is in 0..1 over the texture, v not flipped
+	//                     -- multiplied by the submesh texture size here)
 	//                     uint8 bone[4]; uint8 weight[4] (sum 255);
 	//                     int flag (0/1, meaning unknown); int 0
 	//   indices: uint32 triangle list, relative to the mesh's own vertices.
@@ -1562,6 +1671,7 @@ namespace cso_gui
 				const int moff = modelIndex + mi * static_cast<int>(kModelStride);
 				SubModel sub;
 				sub.name = ReadFixedString(Ptr(moff), kMaxSubModelName);
+				sub.radius = Float(moff + 64);
 				const int numMesh = Int(moff + 68);
 				const int meshIndex = Int(moff + 72);
 
@@ -1578,18 +1688,13 @@ namespace cso_gui
 						const int vertIndex = Int(me + 4);
 						const int numIndices = Int(me + 8);
 						const int indexIndex = Int(me + 12);
+						const int numSubMesh = Int(me + 16);
+						const int subMeshIndex = Int(me + 20);
 
-						Mesh mesh;
-						// The texture reference is the first int of the mesh's aux
-						// block (auxIndex): 0 for the body, 1 for the backpack, 2
-						// for the cap in buffclass26s4tr.mdl. The int at +16 is 1 for
-						// every mesh seen so far and is NOT the skin reference.
-						const int auxIndex = Int(me + 20);
-						mesh.skinref = (auxIndex > 0 && InRange(static_cast<size_t>(auxIndex), 4, size_))
-							? Int(auxIndex) : 0;
-						if (numVerts <= 0 || numIndices < 3 || vertIndex <= 0 || indexIndex <= 0)
+						if (numVerts <= 0 || numIndices < 3 || vertIndex <= 0 ||
+							indexIndex <= 0)
 						{
-							sub.meshes.push_back(std::move(mesh));
+							sub.meshes.push_back(Mesh());
 							continue;
 						}
 						if (!InRange(static_cast<size_t>(vertIndex),
@@ -1598,21 +1703,69 @@ namespace cso_gui
 								sizeof(uint32_t) * static_cast<size_t>(numIndices), size_))
 							throw std::runtime_error("model: mesh geometry out of range");
 
-						const Texture *tex = textureForSkin(mesh.skinref);
-						const float texW = tex ? static_cast<float>(tex->width) : 256.0f;
-						const float texH = tex ? static_cast<float>(tex->height) : 256.0f;
+						// Submesh table: (skinRef, firstIndex, indexCount) ranges
+						// of the index list, each with its own texture. 12-byte
+						// entries in every file seen; a 16-byte stride is
+						// accepted too, whichever makes the ranges tile the whole
+						// list. Without a usable table the whole list is one
+						// submesh on the skin ref stored at subMeshIndex.
+						struct SubRange
+						{
+							int skinRef = 0;
+							int first = 0;
+							int count = 0;
+						};
+						std::vector<SubRange> ranges;
+						for (const size_t entryStride : { size_t(12), size_t(16) })
+						{
+							if (numSubMesh <= 0 || numSubMesh > 64 || subMeshIndex <= 0)
+								continue;
+							// Every entry but the last is entryStride long; only
+							// the first 12 bytes of the last one are read.
+							const size_t tableBytes =
+								entryStride * static_cast<size_t>(numSubMesh - 1) + 12;
+							if (!InRange(static_cast<size_t>(subMeshIndex), tableBytes, size_))
+								continue;
+							std::vector<SubRange> trial;
+							int expectedStart = 0;
+							bool ok = true;
+							for (int k = 0; k < numSubMesh && ok; ++k)
+							{
+								const int e = subMeshIndex + k * static_cast<int>(entryStride);
+								SubRange r{ Int(e), Int(e + 4), Int(e + 8) };
+								ok = r.first == expectedStart && r.count >= 0 &&
+									r.count % 3 == 0 && r.first + r.count <= numIndices &&
+									r.skinRef >= 0;
+								expectedStart = r.first + r.count;
+								trial.push_back(r);
+							}
+							if (ok && expectedStart == numIndices)
+							{
+								ranges = std::move(trial);
+								break;
+							}
+						}
+						if (ranges.empty())
+						{
+							const int skin = (subMeshIndex > 0 &&
+								InRange(static_cast<size_t>(subMeshIndex), sizeof(int32_t), size_))
+								? Int(subMeshIndex) : 0;
+							ranges.push_back({ skin, 0, numIndices - numIndices % 3 });
+						}
 
-						// Per-vertex UVs of this mesh (texel units, like the old format).
-						std::vector<float> us(static_cast<size_t>(numVerts));
-						std::vector<float> vs(static_cast<size_t>(numVerts));
+						// Vertices of this mesh, shared by all its submeshes. The
+						// UVs stay 0..1 here; each submesh scales them with its
+						// own texture size below.
+						std::vector<float> rawU(static_cast<size_t>(numVerts));
+						std::vector<float> rawV(static_cast<size_t>(numVerts));
 						const size_t baseVert = sub.rawVerts.size();
 						for (int i = 0; i < numVerts; ++i)
 						{
 							const int v = vertIndex + i * static_cast<int>(kVertexStride);
 							sub.rawVerts.push_back({ Float(v), Float(v + 4), Float(v + 8) });
 							sub.rawNorms.push_back({ Float(v + 12), Float(v + 16), Float(v + 20) });
-							us[static_cast<size_t>(i)] = Float(v + 24) * texW;
-							vs[static_cast<size_t>(i)] = Float(v + 28) * texH;
+							rawU[static_cast<size_t>(i)] = Float(v + 24);
+							rawV[static_cast<size_t>(i)] = Float(v + 28);
 
 							VertexWeights vw;
 							int sum = 0;
@@ -1628,43 +1781,60 @@ namespace cso_gui
 							sub.vertWeights.push_back(vw);
 						}
 
-						const int numTris = numIndices / 3;
-						mesh.triangles.reserve(static_cast<size_t>(numTris));
-						for (int t = 0; t < numTris; ++t)
+						for (const SubRange &range : ranges)
 						{
-							uint32_t idx[3];
-							std::memcpy(idx, base_ + indexIndex + static_cast<size_t>(t) * 12, sizeof(idx));
-							if (idx[0] >= static_cast<uint32_t>(numVerts) ||
-								idx[1] >= static_cast<uint32_t>(numVerts) ||
-								idx[2] >= static_cast<uint32_t>(numVerts))
-								continue;  // corrupt index: skip the triangle
+							Mesh mesh;
+							mesh.skinref = range.skinRef;
+							// UVs in texel units of this submesh's texture,
+							// like the old format (the viewer divides by the
+							// texture size again when uploading).
+							const Texture *tex = textureForSkin(mesh.skinref);
+							const float texW = tex ? static_cast<float>(tex->width) : 256.0f;
+							const float texH = tex ? static_cast<float>(tex->height) : 256.0f;
 
-							Triangle tri;
-							const int g[3] = {
-								static_cast<int>(baseVert + idx[0]),
-								static_cast<int>(baseVert + idx[1]),
-								static_cast<int>(baseVert + idx[2]) };
-							tri.a = sub.rawVerts[static_cast<size_t>(g[0])];
-							tri.b = sub.rawVerts[static_cast<size_t>(g[1])];
-							tri.c = sub.rawVerts[static_cast<size_t>(g[2])];
-							tri.na = sub.rawNorms[static_cast<size_t>(g[0])];
-							tri.nb = sub.rawNorms[static_cast<size_t>(g[1])];
-							tri.nc = sub.rawNorms[static_cast<size_t>(g[2])];
-							tri.sa = us[idx[0]]; tri.ta = vs[idx[0]];
-							tri.sb = us[idx[1]]; tri.tb = vs[idx[1]];
-							tri.sc = us[idx[2]]; tri.tc = vs[idx[2]];
-							tri.texture = mesh.skinref;
-							tri.vertA = g[0]; tri.vertB = g[1]; tri.vertC = g[2];
-							tri.normA = g[0]; tri.normB = g[1]; tri.normC = g[2];
-							// Dominant bone only for the legacy fields; the real
-							// (weighted) skinning happens in ApplyFrame.
-							tri.boneA = sub.vertWeights[static_cast<size_t>(g[0])].bones[0];
-							tri.boneB = sub.vertWeights[static_cast<size_t>(g[1])].bones[0];
-							tri.boneC = sub.vertWeights[static_cast<size_t>(g[2])].bones[0];
-							tri.normBoneA = tri.boneA; tri.normBoneB = tri.boneB; tri.normBoneC = tri.boneC;
-							mesh.triangles.push_back(tri);
+							const int numTris = range.count / 3;
+							mesh.triangles.reserve(static_cast<size_t>(numTris));
+							for (int t = 0; t < numTris; ++t)
+							{
+								uint32_t idx[3];
+								std::memcpy(idx, base_ + indexIndex +
+									(static_cast<size_t>(range.first) +
+										static_cast<size_t>(t) * 3) * sizeof(uint32_t),
+									sizeof(idx));
+								if (idx[0] >= static_cast<uint32_t>(numVerts) ||
+									idx[1] >= static_cast<uint32_t>(numVerts) ||
+									idx[2] >= static_cast<uint32_t>(numVerts))
+									continue;  // corrupt index: skip the triangle
+
+								Triangle tri;
+								const int g[3] = {
+									static_cast<int>(baseVert + idx[0]),
+									static_cast<int>(baseVert + idx[1]),
+									static_cast<int>(baseVert + idx[2]) };
+								tri.a = sub.rawVerts[static_cast<size_t>(g[0])];
+								tri.b = sub.rawVerts[static_cast<size_t>(g[1])];
+								tri.c = sub.rawVerts[static_cast<size_t>(g[2])];
+								tri.na = sub.rawNorms[static_cast<size_t>(g[0])];
+								tri.nb = sub.rawNorms[static_cast<size_t>(g[1])];
+								tri.nc = sub.rawNorms[static_cast<size_t>(g[2])];
+								tri.sa = rawU[idx[0]] * texW; tri.ta = rawV[idx[0]] * texH;
+								tri.sb = rawU[idx[1]] * texW; tri.tb = rawV[idx[1]] * texH;
+								tri.sc = rawU[idx[2]] * texW; tri.tc = rawV[idx[2]] * texH;
+								tri.texture = mesh.skinref;
+								tri.vertA = g[0]; tri.vertB = g[1]; tri.vertC = g[2];
+								tri.normA = g[0]; tri.normB = g[1]; tri.normC = g[2];
+								// Dominant bone only for the legacy fields; the real
+								// (weighted) skinning happens in ApplyFrame.
+								tri.boneA = sub.vertWeights[static_cast<size_t>(g[0])].bones[0];
+								tri.boneB = sub.vertWeights[static_cast<size_t>(g[1])].bones[0];
+								tri.boneC = sub.vertWeights[static_cast<size_t>(g[2])].bones[0];
+								tri.normBoneA = tri.boneA;
+								tri.normBoneB = tri.boneB;
+								tri.normBoneC = tri.boneC;
+								mesh.triangles.push_back(tri);
+							}
+							sub.meshes.push_back(std::move(mesh));
 						}
-						sub.meshes.push_back(std::move(mesh));
 					}
 				}
 				part.models.push_back(std::move(sub));
@@ -1903,8 +2073,8 @@ namespace cso_gui
 		for (auto &bp : bodyParts_)
 			for (auto &sub : bp.models)
 			{
-				if (!sub.vertWeights.empty() && sub.vertWeights.size() == sub.rawVerts.size() &&
-					!skin.empty())
+				if (!sub.vertWeights.empty() &&
+					sub.vertWeights.size() == sub.rawVerts.size() && !skin.empty())
 				{
 					std::vector<Vec3> pos(sub.rawVerts.size());
 					std::vector<Vec3> nrm(sub.rawVerts.size());

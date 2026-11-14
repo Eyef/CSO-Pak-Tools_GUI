@@ -42,6 +42,7 @@
 #include <QVBoxLayout>
 
 #include "TgaImage.h"
+#include "MdlConverter.h"
 
 #ifdef _WIN32
 #include "EucKrCodec.h"
@@ -1941,6 +1942,274 @@ void MainWindow::ExtractIndicesToDirectory(const std::vector<PakTreeModel::Resol
 	QMessageBox::information(this, tr("Extraction complete"), summary);
 }
 
+MainWindow::FoundEntry MainWindow::EntryForRef(const PakTreeModel::ResolvedRef &ref) const
+{
+	FoundEntry found;
+	if (ref.isNar)
+	{
+		if (ref.narIndex < 0 || ref.narIndex >= static_cast<int>(narArchives_.size()))
+			return found;
+		const auto *archive = narArchives_[static_cast<size_t>(ref.narIndex)].get();
+		if (ref.entryIndex < 0 || ref.entryIndex >= static_cast<int>(archive->Entries().size()))
+			return found;
+		found.nar = archive;
+		found.narEntry = &archive->Entries()[static_cast<size_t>(ref.entryIndex)];
+		return found;
+	}
+	if (ref.pakIndex < 0 || ref.pakIndex >= static_cast<int>(archives_.size()))
+		return found;
+	const auto *archive = archives_[static_cast<size_t>(ref.pakIndex)].get();
+	if (ref.entryIndex < 0 || ref.entryIndex >= static_cast<int>(archive->Entries().size()))
+		return found;
+	found.pak = archive;
+	found.pakEntry = &archive->Entries()[static_cast<size_t>(ref.entryIndex)];
+	return found;
+}
+
+void MainWindow::ConvertSelectedModelsToV10(const std::vector<PakTreeModel::ResolvedRef> &refs)
+{
+	if (!HasArchives())
+		return;
+
+	// Only .mdl entries take part: a folder selection also resolves to the
+	// model's textures and .seq companions, which must not be touched.
+	std::vector<FoundEntry> models;
+	for (const auto &ref : refs)
+	{
+		FoundEntry entry = EntryForRef(ref);
+		if (entry.valid() && entry.extension() == QLatin1String("mdl"))
+			models.push_back(std::move(entry));
+	}
+	if (models.empty())
+	{
+		QMessageBox::information(this, tr("No models selected"),
+			tr("Select one or more .mdl models in the tree first."));
+		return;
+	}
+
+	const QString dir = QFileDialog::getExistingDirectory(this,
+		tr("Choose output folder for the converted models"));
+	if (dir.isEmpty())
+		return;
+
+	cso_gui::MdlConvertSettings settings;
+	QStringList convertedLines;
+	QStringList skippedLines;
+	QStringList errorLines;
+	QStringList warningLines;
+	int converted = 0;
+
+	QProgressDialog progress(tr("Converting models to the classic v10 format..."),
+		tr("Cancel"), 0, static_cast<int>(models.size()), this);
+	progress.setWindowModality(Qt::WindowModal);
+	progress.setMinimumDuration(0);
+
+	// Names in this batch must stay unique so one model's .mdl/.seq pair
+	// cannot overwrite another's; the archive extraction behaves the same.
+	std::set<QString> usedNames;
+	for (int index = 0; index < static_cast<int>(models.size()); ++index)
+	{
+		if (progress.wasCanceled())
+			break;
+		const FoundEntry &entry = models[static_cast<size_t>(index)];
+		progress.setLabelText(tr("Converting %1...").arg(entry.fileName()));
+		progress.setValue(index);
+		QApplication::processEvents();
+
+		std::vector<uint8_t> data;
+		try
+		{
+			data = entry.extract();
+		}
+		catch (const std::exception &ex)
+		{
+			errorLines << tr("%1: %2").arg(entry.fileName(), QString::fromUtf8(ex.what()));
+			continue;
+		}
+
+		const auto version = [&data]()
+		{
+			if (data.size() < 8)
+				return 0;
+			const auto raw = static_cast<std::uint32_t>(data[4]) |
+				(static_cast<std::uint32_t>(data[5]) << 8) |
+				(static_cast<std::uint32_t>(data[6]) << 16) |
+				(static_cast<std::uint32_t>(data[7]) << 24);
+			return static_cast<int>(raw);
+		}();
+		if (!cso_gui::IsModel2026(data))
+		{
+			if (version == 20 || version == 21)
+				skippedLines << tr("%1: ICE-encrypted model (version %2); decrypt it first")
+					.arg(entry.fileName()).arg(version);
+			else
+				skippedLines << tr("%1: not a 2026 model (version %2)")
+					.arg(entry.fileName()).arg(version);
+			continue;
+		}
+
+		QString stem = QFileInfo(entry.fileName()).completeBaseName();
+		if (stem.isEmpty())
+			stem = QStringLiteral("model");
+		QString unique = stem;
+		for (int counter = 2; !usedNames.insert(unique).second; ++counter)
+			unique = stem + QLatin1Char('-') + QString::number(counter);
+		const QString outPath = QDir(dir).filePath(unique + QStringLiteral(".mdl"));
+
+		try
+		{
+			cso_gui::StudioModel model;
+			model.Load(data);
+
+			cso_gui::MdlConvertReport report;
+			const std::vector<uint8_t> result = cso_gui::ConvertModel2026ToV10(
+				model, data, settings, &report);
+			if (result.empty())
+				throw std::runtime_error("the converter produced an empty file");
+
+			QFile file(outPath);
+			if (!file.open(QIODevice::WriteOnly))
+				throw std::runtime_error("failed to open the output file");
+			if (file.write(reinterpret_cast<const char *>(result.data()),
+					static_cast<qint64>(result.size())) != static_cast<qint64>(result.size()))
+				throw std::runtime_error("failed to write the output file");
+			file.close();
+
+			for (const std::string &warning : report.warnings)
+				warningLines << tr("%1: %2").arg(entry.fileName(), QString::fromStdString(warning));
+
+			// Animations live in "<model name><N>.seq" companions; the old
+			// client finds them by file name, so copy the ones the classic
+			// 12-byte animation records can express.
+			int copiedSeqFiles = 0;
+			int copiedSequences = 0;
+			const auto companions = FindSequenceCompanions(entry);
+			if (!companions.empty())
+			{
+				cso_gui::StudioModel probe;
+				probe.Load(data);
+				for (const auto &[group, seqEntry] : companions)
+				{
+					if (progress.wasCanceled())
+						break;
+					std::vector<uint8_t> seqData;
+					try
+					{
+						seqData = seqEntry.extract();
+					}
+					catch (const std::exception &ex)
+					{
+						warningLines << tr("%1%2.seq skipped: %3")
+							.arg(unique).arg(group).arg(QString::fromUtf8(ex.what()));
+						continue;
+					}
+
+					const std::size_t before = probe.Sequences().size();
+					int added = 0;
+					try
+					{
+						added = probe.AppendExternalSequences(seqData, group);
+					}
+					catch (const std::exception &ex)
+					{
+						warningLines << tr("%1%2.seq skipped: %3")
+							.arg(unique).arg(group).arg(QString::fromUtf8(ex.what()));
+						continue;
+					}
+					if (added <= 0)
+					{
+						warningLines << tr("%1%2.seq skipped: it adds no sequences")
+							.arg(unique).arg(group);
+						continue;
+					}
+
+					bool wideRecords = false;
+					for (std::size_t i = before; i < probe.Sequences().size(); ++i)
+					{
+						if (probe.Sequences()[i].animStride != 12)
+							wideRecords = true;
+					}
+					if (wideRecords)
+					{
+						warningLines << tr("%1%2.seq skipped: its animation records use "
+							"32-bit offsets, which the classic format cannot store")
+							.arg(unique).arg(group);
+						continue;
+					}
+
+					const QString seqPath = QDir(dir).filePath(
+						unique + QString::number(group) + QStringLiteral(".seq"));
+					QFile seqFile(seqPath);
+					if (!seqFile.open(QIODevice::WriteOnly) ||
+						seqFile.write(reinterpret_cast<const char *>(seqData.data()),
+							static_cast<qint64>(seqData.size())) != static_cast<qint64>(seqData.size()))
+					{
+						warningLines << tr("%1%2.seq could not be written")
+							.arg(unique).arg(group);
+						continue;
+					}
+					++copiedSeqFiles;
+					copiedSequences += added;
+				}
+			}
+
+			QString line = tr("%1: %2 triangles, %3 vertices, %4 normals, %5 texture(s)")
+				.arg(unique + QStringLiteral(".mdl"))
+				.arg(report.triangles).arg(report.vertices).arg(report.normals)
+				.arg(report.textures);
+			if (copiedSeqFiles > 0)
+				line += tr(", %1 animation(s) from %2 .seq file(s)")
+					.arg(copiedSequences).arg(copiedSeqFiles);
+			convertedLines << line;
+			++converted;
+		}
+		catch (const std::exception &ex)
+		{
+			errorLines << tr("%1: %2").arg(entry.fileName(), QString::fromUtf8(ex.what()));
+		}
+	}
+	progress.setValue(static_cast<int>(models.size()));
+
+	QStringList headline;
+	if (converted > 0)
+		headline << tr("Converted %1 model(s) to %2.")
+			.arg(converted).arg(QDir::toNativeSeparators(dir));
+	if (!skippedLines.isEmpty())
+		headline << tr("Skipped %1 file(s) that are not 2026 models.").arg(skippedLines.size());
+	if (!errorLines.isEmpty())
+		headline << tr("%1 model(s) failed.").arg(errorLines.size());
+	if (converted == 0 && skippedLines.isEmpty() && errorLines.isEmpty())
+		headline << tr("Nothing was converted.");
+	if (!warningLines.isEmpty())
+		headline << tr("See the details for %1 warning(s).").arg(warningLines.size());
+
+	QStringList details;
+	if (!convertedLines.isEmpty())
+		details << tr("Converted:") + QStringLiteral("\n  ") +
+			convertedLines.join(QStringLiteral("\n  "));
+	if (!skippedLines.isEmpty())
+		details << tr("Skipped:") + QStringLiteral("\n  ") +
+			skippedLines.join(QStringLiteral("\n  "));
+	if (!errorLines.isEmpty())
+		details << tr("Errors:") + QStringLiteral("\n  ") +
+			errorLines.join(QStringLiteral("\n  "));
+	if (!warningLines.isEmpty())
+		details << tr("Warnings:") + QStringLiteral("\n  ") +
+			warningLines.join(QStringLiteral("\n  "));
+
+	QMessageBox box(this);
+	box.setIcon(converted > 0 ? QMessageBox::Information : QMessageBox::Warning);
+	box.setWindowTitle(tr("Model conversion"));
+	box.setText(headline.join(QLatin1Char('\n')));
+	if (!details.isEmpty())
+		box.setDetailedText(details.join(QStringLiteral("\n\n")));
+	box.exec();
+
+	if (converted > 0)
+		statusBar()->showMessage(tr("Converted %1 model(s) to %2")
+			.arg(converted).arg(QDir::toNativeSeparators(dir)), 8000);
+}
+
 void MainWindow::OnPackDirectory()
 {
 	const QString inputDir = QFileDialog::getExistingDirectory(this,
@@ -2147,6 +2416,7 @@ void MainWindow::OnTreeContextMenu(const QPoint &pos)
 	// Real archive files in the selection (WAD lumps are not among them).
 	const auto refs = CollectSelectedRefs();
 	bool hasCso = false;
+	bool hasMdl = false;
 	for (const auto &ref : refs)
 	{
 		QString path;
@@ -2168,7 +2438,26 @@ void MainWindow::OnTreeContextMenu(const QPoint &pos)
 		if (path.endsWith(QLatin1String(".cso"), Qt::CaseInsensitive))
 		{
 			hasCso = true;
-			break;
+		}
+		if (path.endsWith(QLatin1String(".mdl"), Qt::CaseInsensitive))
+			hasMdl = true;
+	}
+
+	// With exactly one file selected the model's version is cheap to read, so
+	// offer the conversion only for 2026 models.  With several files or a
+	// folder the entries are not read here (that could be slow); the
+	// conversion itself skips old models and reports them.
+	if (hasMdl && refs.size() == 1)
+	{
+		try
+		{
+			const FoundEntry entry = EntryForRef(refs.front());
+			if (entry.valid())
+				hasMdl = cso_gui::IsModel2026(entry.extract());
+		}
+		catch (const std::exception &)
+		{
+			// Unreadable entry: keep the item; the conversion reports the error.
 		}
 	}
 
@@ -2195,6 +2484,12 @@ void MainWindow::OnTreeContextMenu(const QPoint &pos)
 		if (hasCso)
 			menu.addAction(tr("Extract Selected (Decode .cso to CSV)..."),
 				this, &MainWindow::OnExtractSelectedDecoded);
+		if (hasMdl)
+		{
+			menu.addSeparator();
+			menu.addAction(tr("Convert 2026 Models to Classic v10..."),
+				this, [this, refs]() { ConvertSelectedModelsToV10(refs); });
+		}
 	}
 	menu.exec(treeView_->viewport()->mapToGlobal(pos));
 }
@@ -3060,41 +3355,26 @@ void MainWindow::EnsureNeighborArchivesLoaded()
 	findCache_.clear();
 }
 
-void MainWindow::LoadExternalSequences(const std::shared_ptr<cso_gui::StudioModel> &model,
-	const FoundEntry &modelRef)
+std::map<int, MainWindow::FoundEntry> MainWindow::FindSequenceCompanions(const FoundEntry &modelRef)
 {
-	externalSeqInfo_.clear();
-	externalSeqBase_.clear();
-	if (!model || !model->IsValid() || model->Bones().empty() || !modelRef.valid())
-		return;
+	std::map<int, FoundEntry> found;
+	if (!modelRef.valid())
+		return found;
 
 	QString modelPath = modelRef.displayPath();
 	modelPath.replace(QLatin1Char('\\'), QLatin1Char('/'));
 	modelPath = modelPath.toLower();
 	if (!modelPath.endsWith(QStringLiteral(".mdl")))
-		return;
+		return found;
 	const int modelSlash = modelPath.lastIndexOf(QLatin1Char('/'));
 	const QString modelDir = modelSlash >= 0 ? modelPath.left(modelSlash) : QString();
 	const QString modelBase = modelPath.mid(modelSlash + 1,
 		modelPath.size() - modelSlash - 1 - 4);
 	if (modelBase.isEmpty())
-		return;
-	externalSeqBase_ = modelRef.fileName().chopped(4);
-
-	// Keep "path  —  archive" visible while the (possibly long) neighbour
-	// scan runs, and after it: every later status message for this model
-	// is built on top of it instead of replacing it.
-	const QString entryStatus = tr("%1  —  %2")
-		.arg(modelRef.displayPath(), modelRef.archiveName());
-	statusBar()->showMessage(entryStatus);
+		return found;
 
 	if (searchNeighborSeq_)
 		EnsureNeighborArchivesLoaded();
-
-	// group number N -> the "<model>N.seq" entry to use. The first hit wins,
-	// and archives are visited in priority order: the model's own archive,
-	// the other loaded ones, then (if enabled) the neighbours.
-	std::map<int, FoundEntry> found;
 
 	const auto hasSeqExtension = [](const auto &path) -> bool
 	{
@@ -3178,6 +3458,37 @@ void MainWindow::LoadExternalSequences(const std::shared_ptr<cso_gui::StudioMode
 		for (const auto &archive : neighborNarArchives_)
 			scanNar(archive.get());
 	}
+	return found;
+}
+
+void MainWindow::LoadExternalSequences(const std::shared_ptr<cso_gui::StudioModel> &model,
+	const FoundEntry &modelRef)
+{
+	externalSeqInfo_.clear();
+	externalSeqBase_.clear();
+	if (!model || !model->IsValid() || model->Bones().empty() || !modelRef.valid())
+		return;
+
+	QString modelPath = modelRef.displayPath();
+	modelPath.replace(QLatin1Char('\\'), QLatin1Char('/'));
+	modelPath = modelPath.toLower();
+	if (!modelPath.endsWith(QStringLiteral(".mdl")))
+		return;
+	if (modelRef.fileName().isEmpty())
+		return;
+	externalSeqBase_ = modelRef.fileName().chopped(4);
+
+	// Keep "path  —  archive" visible while the (possibly long) neighbour
+	// scan runs, and after it: every later status message for this model
+	// is built on top of it instead of replacing it.
+	const QString entryStatus = tr("%1  —  %2")
+		.arg(modelRef.displayPath(), modelRef.archiveName());
+	statusBar()->showMessage(entryStatus);
+
+	// group number N -> the "<model>N.seq" entry to use. The first hit wins,
+	// and archives are visited in priority order: the model's own archive,
+	// the other loaded ones, then (if enabled) the neighbours.
+	std::map<int, FoundEntry> found = FindSequenceCompanions(modelRef);
 	if (found.empty())
 		return;
 

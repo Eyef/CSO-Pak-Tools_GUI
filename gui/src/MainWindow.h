@@ -246,6 +246,17 @@ private:
 		const QString &destRoot, bool decodeCso = false);
 	std::vector<PakTreeModel::ResolvedRef> CollectSelectedRefs() const;
 
+	// Converts the selected 2026 .mdl entries to the classic v10 layout (what
+	// the stock GoldSrc/Steam client reads) and writes them, with their
+	// compatible "<model name><N>.seq" companions, to a chosen folder.
+	void ConvertSelectedModelsToV10(const std::vector<PakTreeModel::ResolvedRef> &refs);
+	FoundEntry EntryForRef(const PakTreeModel::ResolvedRef &ref) const;
+	// "<model dir>/<model name><N>.seq" companion entries for `modelRef`,
+	// group number N -> entry. The model's own archive is searched first,
+	// then the other loaded ones (and the neighbours when that option is on).
+	// Empty when the model path is unusable or nothing matches.
+	std::map<int, FoundEntry> FindSequenceCompanions(const FoundEntry &modelRef);
+
 	static QString ExtensionOf(const cso_pak::PakArchive::Entry &entry);
 	static QString ExtensionOf(const cso_pak::NarArchive::Entry &entry);
 	static bool LooksLikeText(const std::vector<uint8_t> &data);
