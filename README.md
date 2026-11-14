@@ -8,7 +8,10 @@ archives (where CSO keeps most models), and it can write `.nar` archives back
 retail CSO data needs no external tools. It previews text, images
 (TGA/DDS/WAD textures and `.ico` icons), audio/video, CSV tables, `.mdl`
 models and `.spr` sprites in 3D/animated viewers, and whole `.bsp` maps with
-baked lighting, placed models/sprites and an optional skybox.
+baked lighting, placed models/sprites and an optional skybox. Besides the
+classic and ICE-encrypted models it opens the newer "version 2026" CSO models
+(BC7 textures, indexed triangle lists, per-vertex bone weights) and can convert
+them back to the classic v10 layout that the stock GoldSrc client reads.
 
 ```
 project/
@@ -32,12 +35,14 @@ project/
     ├── resources/
     │   ├── app.rc                  Windows resource script: exe icon + version/author info
     │   └── cpb.ico                 exe file icon
-    └── src/                      Qt GUI (27 files)
+    └── src/                      Qt GUI (33 files)
         ├── main.cpp                Qt application entry point
         ├── MainWindow.h/.cpp       window layout, tree wiring, preview dispatch, extraction,
         │                            pak pack/patch, and everything that feeds the viewers:
         │                            texture/model resolution across archives, .wad lookup, BSP
-        │                            map assembly (placed models, sprites, skybox)
+        │                            map assembly (placed models, sprites, skybox), `.seq`
+        │                            companion lookup and the "Convert 2026 Models to Classic
+        │                            v10..." batch action (right-click menu)
         ├── MainWindowNar.cpp       NAR pack/patch/unpack/verify actions (delegates to core/NarTools)
         ├── PakTreeModel.h/.cpp     QAbstractItemModel that turns entry paths of every loaded
         │                            .pak/.nar (and the lumps of .wad files) into one folder tree
@@ -45,8 +50,12 @@ project/
         ├── EucKrCodec.h/.cpp       Windows-only EUC-KR/CP949 (Korean) to UTF-8 decoding for .cso text
         ├── ByteCursor.h            shared bounds-checked little-endian reader (.spr, .dds, .wad, .bsp)
         ├── DxtDecompress.h/.cpp    shared DXT1/DXT3/DXT5 block decompression (.spr v3, .dds)
-        ├── DdsImage.h/.cpp         standalone .dds decoder: DXT1/DXT3/DXT5 plus common
-        │                            uncompressed RGB/RGBA/luminance layouts, mip level 0 only
+        │                            and the `MakeRgbaImage` helper used by every decoder
+        ├── Bc7Decompress.h/.cpp    BC7 (BPTC) block decompression, all 8 modes (2026 model
+        │                            textures, DX10 .dds files)
+        ├── DdsImage.h/.cpp         standalone .dds decoder: DXT1/DXT3/DXT5, DX10-header BC1/2/3/7
+        │                            and RGBA8/BGRA8, plus common uncompressed RGB/RGBA/luminance
+        │                            layouts, mip level 0 only
         ├── Wad3Archive.h/.cpp      WAD2 (Quake)/WAD3 (Half-Life/GoldSource) archive parser plus a
         │                            miptex texture decoder, for .wad files (inside archives or loose)
         ├── SpriteImage.h/.cpp      decoder for GoldSource/CSO .spr sprites (v2 palette-indexed,
@@ -54,7 +63,16 @@ project/
         │                            type and frame origins (for placing sprites on maps)
         ├── StudioModel.h/.cpp      parser for GoldSource/CSO studiomdl (.mdl) files: bones, meshes,
         │                            textures, skins, bodyparts (with the `base` divisor used by the
-        │                            map "body" key) and sequence (animation) data
+        │                            map "body" key) and sequence (animation) data, including
+        │                            external `.seq` animations and the version 2026 layout
+        │                            (BC7 textures, triangle lists, up to four weights per vertex,
+        │                            wide 32-bit animation records)
+        ├── MdlConverter.h/.cpp     converts a version 2026 model to a classic GoldSrc v10 .mdl
+        │                            (triangle strips, 16-bit indices, one bone per vertex,
+        │                            8-bit paletted textures) and validates the result
+        ├── TextureQuantizer.h/.cpp RGBA -> 256-colour paletted picture (median cut + k-means,
+        │                            optional Floyd-Steinberg dither, `{` masked textures) and a
+        │                            box-filter resize; used by the converter
         ├── ModelViewWidget.h/.cpp  QOpenGLWidget: renders a StudioModel with orbit / first-person
         │                            camera, bodygroup/skin selection, wireframe, sequence playback
         ├── BspMap.h/.cpp           GoldSrc BSP v30 parser (all lumps, textures, entities), brush-entity
@@ -307,8 +325,10 @@ whole step.
   - `.dds` → decoded and shown as an image: DXT1/DXT3/DXT5 compressed, plus
     common uncompressed RGB/RGBA/luminance layouts (whatever channel order
     the file's own bitmasks describe). Only mip level 0 is decoded — plenty
-    for a preview. BC4-7/ATI2 and DX10-extended-header DDS files aren't
-    supported and fall back to the properties panel with the reason why.
+    for a preview. DX10-extended-header files are accepted for BC1/2/3/7 and
+    RGBA8/BGRA8 (BC7 is what the 2026 model textures use). BC4-6/ATI2 and
+    other formats aren't supported and fall back to the properties panel with
+    the reason why.
   - `.png/.jpg/.bmp/.gif/.ppm/.ico` → shown natively via Qt in case any turn
     up. A multi-size `.ico` (the ones in `cstrike.nar` carry up to six
     variants) shows its largest frame instead of the first, which is usually
@@ -428,6 +448,15 @@ whole step.
     (`StudioModel::AppendExternalSequences`). A `.seq` that does not fit the
     model's skeleton is rejected. Models placed on a BSP map do not load
     `.seq` files.
+    Version 2026 models (CSO 2026 update) open like any other `.mdl`: BC7
+    textures are decoded (`Bc7Decompress`), the indexed triangle lists are
+    skinned with up to four bone weights per vertex, and their animations
+    may use 32-bit ("wide") animation records, detected per sequence from
+    the data. Rotation keys are decoded either with the bone's own scales or
+    as radians * 10240, chosen per sequence, because some `.seq` files use
+    one encoding and some the other; shop scenes that stack a second skeleton
+    in the same file keep the bone scales for that skeleton
+    (`Sequence::uniformRotationScale`, `mdlScaledBones`).
     Some models only *name* a texture (CSO's own convention: a `#`-prefixed
     name, or a tiny placeholder image like 4×1) and ship the real pixels as
     a separate loose file elsewhere in the same pak — the tool searches
@@ -578,6 +607,9 @@ whole step.
   Korean-detection treatment as the preview, and are written out as `.csv`
   (not `.cso`) with the decoded, readable content. Everything else in the
   selection is extracted as-is, same as the plain Extract Selected.
+- Right-click one or more `.mdl` entries → **Convert 2026 Models to Classic
+  v10...** — see [Converting 2026 models](#converting-2026-models-to-classic-v10)
+  below.
 - Double-click a file to save just that one file via a Save As dialog.
 - **File → Pack Directory into New Pak...** — same as the console tool's
   `pack` command: pick a folder, pick where to save the new `.pak`.
@@ -590,6 +622,44 @@ whole step.
   Integrity...** — the `.nar` counterparts of the actions above; see
   [".nar write support and ICE models"](#nar-write-support-and-ice-models)
   for their options.
+
+## Converting 2026 models to classic v10
+
+The stock GoldSrc/Steam client cannot read version 2026 models, so the browser
+can rewrite them in the classic layout (`MdlConverter`, `TextureQuantizer`).
+Select one or more `.mdl` entries (or folders containing them) in the tree,
+right-click → **Convert 2026 Models to Classic v10...** and pick an output
+folder. Only plain (already decrypted) version 2026 `.mdl` files take part;
+anything else is listed as skipped (ICE-encrypted v20/v21 models must be
+decrypted first, classic models need no conversion). A progress dialog with
+Cancel is shown and a summary with details (converted / skipped / errors /
+warnings) at the end.
+
+What the conversion does:
+
+- The skeleton, hitboxes, attachments and sequence table are copied from the
+  source file, together with the skin table, so animations and body groups
+  keep working; geometry and textures are rebuilt in the old layout: indexed
+  triangle lists become triangle strips (decoded again after building and
+  checked against the source triangles), vertices and normals are
+  deduplicated into the 16-bit index space (at most 32767 each per submodel).
+- The classic format has one bone per vertex, so weighted vertices go to their
+  heaviest bone. The warning list says how many vertices were blended and how
+  many of those had a heaviest weight under 75 %, i.e. may deform differently.
+- BC7 textures are reduced to 256-colour palettes (median cut + 4 k-means
+  refinement passes, Floyd-Steinberg dithering; masked textures use palette
+  index 255 = blue key colour with an alpha threshold of 128) and are
+  downscaled to at most 512 px per side. A texture named `*.dds` is renamed
+  to `*.bmp`. An unreadable texture becomes a magenta placeholder so the skin
+  table stays intact. The settings live in `MdlConvertSettings`; the GUI uses
+  the defaults.
+- Animations stored in `<model name><N>.seq` companions are copied next to the
+  converted model when the classic 12-byte animation records can express them.
+  `.seq` files that use 32-bit records are skipped with a warning. If the
+  model's own animation records are wide, the model is rejected.
+- The result is validated (`ValidateV10Model`) and loaded again with
+  `StudioModel` before it is written; a model that fails any of these checks is
+  reported as an error and no file is written for it.
 
 ## Known limitations
 
@@ -638,13 +708,15 @@ whole step.
   there's a comment marking exactly where.
 - CSV preview doesn't handle quoted fields containing the delimiter; it's a
   preview, not a spreadsheet import.
-- `.dds` support covers DXT1/DXT3/DXT5 and common uncompressed layouts —
-  the formats actually seen in this game's own pak files (and what the
-  `.spr` v3 decoder already needed). Newer compression (BC4-7/ATI2) and the
-  DX10-extended-header variant of DDS aren't implemented; both throw a
+- `.dds` support covers DXT1/DXT3/DXT5, common uncompressed layouts and
+  DX10-header files with BC1/2/3/7 or RGBA8/BGRA8. Other compressions
+  (BC4-6, ATI2) aren't implemented and throw a
   clear "unsupported" message rather than showing garbage. Only mip level 0
   is read, so a texture with 8 mip levels decodes just as fast as one
   without any — the rest of the file is simply never touched.
+- The 2026 → v10 converter is lossy by nature: textures drop to 256 colours
+  and at most 512 px, vertex weights collapse to the heaviest bone, and
+  submodels needing more than 32767 vertices or normals cannot be converted.
 - EUC-KR/CP949 detection for `.cso` files uses the Win32 codepage API
   directly, so it's Windows-only by design (guarded with `#ifdef _WIN32`).
   On other platforms `.cso` content still gets TEA-decrypted and shown as

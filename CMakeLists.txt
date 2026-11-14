@@ -80,6 +80,12 @@ add_executable(cso-pak-gui WIN32
 	gui/src/ByteCursor.h
 	gui/src/DxtDecompress.h
 	gui/src/DxtDecompress.cpp
+	gui/src/Bc7Decompress.h
+	gui/src/Bc7Decompress.cpp
+	gui/src/MdlConverter.h
+	gui/src/MdlConverter.cpp
+	gui/src/TextureQuantizer.h
+	gui/src/TextureQuantizer.cpp
 	gui/src/DdsImage.h
 	gui/src/DdsImage.cpp
 	gui/src/Wad3Archive.h
