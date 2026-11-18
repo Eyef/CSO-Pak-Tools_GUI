@@ -194,6 +194,238 @@ namespace cso_gui
 			}
 			return staticPose ? kAnimStrideShort : 0;
 		}
+
+		// Bilinear filtering blends the colour channels of the transparent
+		// texels into their opaque neighbours, so a keyed-out hole that keeps
+		// the key colour in its RGB paints a bright fringe along every cut-out
+		// at close range (cyan around resident_zombi_origin's seams, yellow
+		// around the palette-keyed tears of the classic models). Spread the
+		// colour of the surrounding opaque texels into the transparent ones:
+		// alpha stays 0, so the holes still work, but the interpolation no
+		// longer pulls the key colour back in. One pass matches the 2x2
+		// footprint of the filter; the second covers diagonals and mip levels.
+		void BleedCutoutColour(QImage &image)
+		{
+			const int width = image.width();
+			const int height = image.height();
+			if (width < 2 || height < 2)
+				return;
+			const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+			std::vector<uint32_t> source(count);
+			std::vector<uint32_t> pixels(count);
+			for (int pass = 0; pass < 2; ++pass)
+			{
+				std::memcpy(source.data(), image.constBits(), count * sizeof(uint32_t));
+				pixels = source;
+				bool changed = false;
+				for (int y = 0; y < height; ++y)
+				{
+					for (int x = 0; x < width; ++x)
+					{
+						const size_t at = static_cast<size_t>(y) * static_cast<size_t>(width) +
+							static_cast<size_t>(x);
+						if ((source[at] >> 24) != 0)
+							continue;
+						uint32_t r = 0, g = 0, b = 0;
+						int n = 0;
+						for (int dy = -1; dy <= 1; ++dy)
+						{
+							const int ny = y + dy;
+							if (ny < 0 || ny >= height)
+								continue;
+							for (int dx = -1; dx <= 1; ++dx)
+							{
+								const int nx = x + dx;
+								if (nx < 0 || nx >= width)
+									continue;
+								const uint32_t neighbour = source[static_cast<size_t>(ny) *
+									static_cast<size_t>(width) + static_cast<size_t>(nx)];
+								if ((neighbour >> 24) == 0)
+									continue;
+								r += (neighbour >> 16) & 0xFFu;
+								g += (neighbour >> 8) & 0xFFu;
+								b += neighbour & 0xFFu;
+								++n;
+							}
+						}
+						if (n == 0)
+							continue;
+						// Alpha stays 0 -- only the colour is replaced.
+						pixels[at] = ((r / static_cast<uint32_t>(n)) << 16) |
+							((g / static_cast<uint32_t>(n)) << 8) |
+							(b / static_cast<uint32_t>(n));
+						changed = true;
+					}
+				}
+				if (!changed)
+					break;
+				std::memcpy(image.bits(), pixels.data(), count * sizeof(uint32_t));
+			}
+		}
+
+		bool StartsWithNoCase(const std::string &text, const char *prefix)
+		{
+			size_t i = 0;
+			for (; prefix[i] != '\0'; ++i)
+			{
+				if (i >= text.size())
+					return false;
+				const unsigned char a = static_cast<unsigned char>(text[i]);
+				const unsigned char b = static_cast<unsigned char>(prefix[i]);
+				const unsigned char lowerA = (a >= 'A' && a <= 'Z') ? a - 'A' + 'a' : a;
+				const unsigned char lowerB = (b >= 'A' && b <= 'Z') ? b - 'A' + 'a' : b;
+				if (lowerA != lowerB)
+					return false;
+			}
+			return true;
+		}
+
+		// Should palette index 255 be cut out of a paletted texture? The MDL
+		// declares that with the masked flag (0x40), but part of CSO's artwork
+		// relies on the key colour without the flag, so three independent
+		// signals identify those. Anything else is ordinary art that happens to
+		// use index 255 -- white paper on a briefing board, the black tyres of a
+		// Humvee, pastel cardboard -- and keying it would punch visible holes.
+		//   - the `$20` material prefix. It marks the masked material: almost
+		//     every `$20` texture in the corpus carries the flag, and the same
+		//     texture ships with and without it ($20_flyzombie_hand in
+		//     v_knife_zombieflying_trans vs v_zombibomb_fly_trans);
+		//   - a pure chroma key colour: max channel near 255 and min near 0
+		//     (pc_zombi's yellow, the cake's blue, buffclass20s2ct_head's red);
+		//   - a near-black key colour, but only when the texels read as a
+		//     background, i.e. at least half of them connect to the image
+		//     border. Scattered black texels are shading in the artwork
+		//     (humvee's tyres, dust/sand noise on terrain).
+		// Number of texels of `slot` that are 4-connected to the picture border.
+		// A key colour paints the background and therefore reaches the edge of
+		// the sheet; a colour used inside the artwork does not.
+		size_t BorderConnectedTexels(const uint8_t *indices, int width, int height,
+			uint8_t slot)
+		{
+			const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+			std::vector<uint8_t> seen(count, 0);
+			std::vector<size_t> stack;
+			const auto push = [&](int x, int y)
+			{
+				if (x < 0 || y < 0 || x >= width || y >= height)
+					return;
+				const size_t p = static_cast<size_t>(y) * static_cast<size_t>(width) +
+					static_cast<size_t>(x);
+				if (indices[p] == slot && !seen[p])
+				{
+					seen[p] = 1;
+					stack.push_back(p);
+				}
+			};
+			for (int x = 0; x < width; ++x)
+			{
+				push(x, 0);
+				push(x, height - 1);
+			}
+			for (int y = 0; y < height; ++y)
+			{
+				push(0, y);
+				push(width - 1, y);
+			}
+			size_t connected = 0;
+			while (!stack.empty())
+			{
+				const size_t p = stack.back();
+				stack.pop_back();
+				++connected;
+				const int x = static_cast<int>(p % static_cast<size_t>(width));
+				const int y = static_cast<int>(p / static_cast<size_t>(width));
+				push(x - 1, y);
+				push(x + 1, y);
+				push(x, y - 1);
+				push(x, y + 1);
+			}
+			return connected;
+		}
+
+		bool ShouldKeyIndex255(const std::string &name, uint8_t red, uint8_t green,
+			uint8_t blue, const uint8_t *indices, int width, int height)
+		{
+			const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+			size_t index255 = 0;
+			for (size_t p = 0; p < count; ++p)
+				if (indices[p] == 255) ++index255;
+			// Nothing to key, or the whole picture is index 255: a solid quad
+			// such as ef_dvhammer2's white flash sheets. Keying that would erase
+			// the effect instead of cutting out a background.
+			if (index255 == 0 || index255 == count)
+				return false;
+			if (StartsWithNoCase(name, "$20"))
+				return true;
+
+			const int maxChannel = std::max({ static_cast<int>(red),
+				static_cast<int>(green), static_cast<int>(blue) });
+			const int minChannel = std::min({ static_cast<int>(red),
+				static_cast<int>(green), static_cast<int>(blue) });
+			if (maxChannel >= 224 && minChannel <= 32)
+				return true;
+			if (maxChannel > 64)
+				return false;
+
+			// Near-black key: the index-255 texels have to read as a
+			// background (see BorderConnectedTexels). Scattered black texels
+			// are shading in the artwork (humvee's tyres, dust/sand noise).
+			return BorderConnectedTexels(indices, width, height, 255) * 2 >= index255;
+		}
+
+		// Palette slot to cut out of a masked texture that no longer contains
+		// index 255. Some newer models were re-quantised and lost the key along
+		// the way: S23_Psycho_Zombie_hand.bmp, the replacement for
+		// v_knife_y25s3psycho's y25s3psycho_hand, kept the masked flag and the
+		// yellow sleeve background, but the colour now sits at slot 100 as
+		// (252,199,5) while index 255 is unused. The key is the dominant pure
+		// chroma colour (max channel near 255, min near 0) whose texels run
+		// into the picture border. In the same texture the blade's fire colours
+		// (424 and 163 texels, none on the border) and in
+		// common_a_brokenmdl03.bmp a red/orange gradient that covers the strip
+		// do not qualify. Returns -1 when nothing convincing is found; the
+		// texture then stays opaque.
+		int RequantisedKeySlot(const uint8_t *indices, const uint8_t *palette,
+			int width, int height)
+		{
+			const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+			size_t histogram[256] = {};
+			for (size_t p = 0; p < count; ++p)
+				++histogram[indices[p]];
+
+			int best = -1;
+			int second = -1;
+			for (int slot = 0; slot < 255; ++slot)
+			{
+				if (histogram[slot] < 200)
+					continue;
+				const int r = palette[slot * 3 + 0];
+				const int g = palette[slot * 3 + 1];
+				const int b = palette[slot * 3 + 2];
+				if (std::max({ r, g, b }) < 224 || std::min({ r, g, b }) > 32)
+					continue;
+				if (best < 0 || histogram[slot] > histogram[best])
+				{
+					second = best;
+					best = slot;
+				}
+				else if (second < 0 || histogram[slot] > histogram[second])
+					second = slot;
+			}
+
+			// The key covers a background-sized part of the sheet, and it is
+			// clearly more common than the next chroma colour: the artwork's
+			// fire/glow tones come in comparable amounts and sit next to each
+			// other in the palette.
+			if (best < 0 || histogram[best] * 100 < count * 2)
+				return -1;
+			if (second >= 0 && histogram[best] < histogram[second] * 4)
+				return -1;
+			if (BorderConnectedTexels(indices, width, height,
+				static_cast<uint8_t>(best)) * 2 < histogram[best])
+				return -1;
+			return best;
+		}
 	}
 
 	struct StudioModel::Header
@@ -397,6 +629,45 @@ namespace cso_gui
 
 			QImage image(tex.width, tex.height, QImage::Format_ARGB32);
 			const size_t pixelCount = static_cast<size_t>(tex.width) * tex.height;
+
+			// Cut-out colour: palette index 255. The masked flag (0x40) always
+			// means "key this index"; without it the parser has to recognise the
+			// textures that lost the flag during conversion (see
+			// ShouldKeyIndex255). A masked texture with no index-255 texels lost
+			// the key itself in re-quantisation; RequantisedKeySlot looks for
+			// where it moved.
+			const bool masked = (tex.flags & 0x40) != 0;
+			int keySlot = -1;
+			Texture::Cutout cutout = Texture::Cutout::None;
+			if (masked)
+			{
+				keySlot = 255;
+				cutout = Texture::Cutout::MaskedIndex;
+				size_t index255 = 0;
+				for (size_t p = 0; p < pixelCount; ++p)
+					if (pixels[p] == 255) ++index255;
+				if (index255 == 0)
+				{
+					const int requantised = RequantisedKeySlot(pixels, palette,
+						tex.width, tex.height);
+					if (requantised >= 0)
+					{
+						keySlot = requantised;
+						cutout = Texture::Cutout::InferredChroma;
+					}
+					else
+						keySlot = -1;
+				}
+			}
+			else if (ShouldKeyIndex255(tex.name,
+				palette[255 * 3 + 0], palette[255 * 3 + 1], palette[255 * 3 + 2],
+				pixels, tex.width, tex.height))
+			{
+				keySlot = 255;
+				cutout = Texture::Cutout::InferredIndex;
+			}
+			tex.cutout = cutout;
+
 			for (size_t p = 0; p < pixelCount; ++p)
 			{
 				const int entry = pixels[p];
@@ -408,11 +679,13 @@ namespace cso_gui
 				const uint8_t b = palette[entry * 3 + 2];
 				uint32_t argb = 0xFF000000u | (uint32_t(r) << 16) |
 					(uint32_t(g) << 8) | uint32_t(b);
-				// Palette index 255 is transparent for masked textures.
-				if (tex.flags & 0x40 && entry == 255)
+				if (keySlot >= 0 && entry == keySlot)
 					argb = 0x00000000u;
 				reinterpret_cast<uint32_t *>(image.bits())[p] = argb;
 			}
+
+			if (keySlot >= 0)
+				BleedCutoutColour(image);
 
 			tex.image = std::move(image);
 			textures_.push_back(std::move(tex));
@@ -425,31 +698,83 @@ namespace cso_gui
 			return;
 
 		Texture &tex = textures_[static_cast<size_t>(index)];
-		// Same rule as for embedded textures: in a masked texture (flag 0x40)
-		// the engine treats palette index 255 as transparent, whatever colour
-		// that palette slot holds (blue, green, pink...). External 8-bit BMPs
-		// keep their indices when Qt loads them as Indexed8, so apply it here
-		// before the image is converted to RGB and the indices are lost.
-		if ((tex.flags & 0x40) && image.format() == QImage::Format_Indexed8)
+		// Same rule as for embedded textures (see ShouldKeyIndex255 and
+		// RequantisedKeySlot). External 8-bit BMPs keep their indices when Qt
+		// loads them as Indexed8, so apply it here before the image is
+		// converted to RGB and the indices are lost.
+		if (image.format() == QImage::Format_Indexed8)
 		{
 			const QList<QRgb> colors = image.colorTable();
-			QImage out(image.width(), image.height(), QImage::Format_ARGB32);
-			for (int y = 0; y < image.height(); ++y)
+			const int width = image.width();
+			const int height = image.height();
+			std::vector<uint8_t> indices(static_cast<size_t>(width) *
+				static_cast<size_t>(height));
+			for (int y = 0; y < height; ++y)
+				std::memcpy(&indices[static_cast<size_t>(y) * static_cast<size_t>(width)],
+					image.constScanLine(y), static_cast<size_t>(width));
+			std::vector<uint8_t> palette(kPaletteBytes, 0);
+			for (int c = 0; c < 256 && c < colors.size(); ++c)
 			{
-				const uchar *src = image.constScanLine(y);
-				QRgb *dst = reinterpret_cast<QRgb *>(out.scanLine(y));
-				for (int x = 0; x < image.width(); ++x)
+				palette[static_cast<size_t>(c) * 3 + 0] = static_cast<uint8_t>(qRed(colors[c]));
+				palette[static_cast<size_t>(c) * 3 + 1] = static_cast<uint8_t>(qGreen(colors[c]));
+				palette[static_cast<size_t>(c) * 3 + 2] = static_cast<uint8_t>(qBlue(colors[c]));
+			}
+
+			const QRgb keyColour = colors.size() > 255 ? colors[255] : 0xFF000000u;
+			const bool masked = (tex.flags & 0x40) != 0;
+			int keySlot = -1;
+			Texture::Cutout cutout = Texture::Cutout::None;
+			if (masked)
+			{
+				keySlot = 255;
+				cutout = Texture::Cutout::MaskedIndex;
+				size_t index255 = 0;
+				for (uint8_t entry : indices)
+					if (entry == 255) ++index255;
+				if (index255 == 0)
 				{
-					const int idx = src[x];
-					dst[x] = (idx == 255)
+					const int requantised = RequantisedKeySlot(indices.data(),
+						palette.data(), width, height);
+					if (requantised >= 0)
+					{
+						keySlot = requantised;
+						cutout = Texture::Cutout::InferredChroma;
+					}
+					else
+						keySlot = -1;
+				}
+			}
+			else if (ShouldKeyIndex255(tex.name,
+				static_cast<uint8_t>(qRed(keyColour)),
+				static_cast<uint8_t>(qGreen(keyColour)),
+				static_cast<uint8_t>(qBlue(keyColour)),
+				indices.data(), width, height))
+			{
+				keySlot = 255;
+				cutout = Texture::Cutout::InferredIndex;
+			}
+			tex.cutout = cutout;
+
+			QImage out(width, height, QImage::Format_ARGB32);
+			for (int y = 0; y < height; ++y)
+			{
+				QRgb *dst = reinterpret_cast<QRgb *>(out.scanLine(y));
+				for (int x = 0; x < width; ++x)
+				{
+					const int idx = indices[static_cast<size_t>(y) *
+						static_cast<size_t>(width) + static_cast<size_t>(x)];
+					dst[x] = (keySlot >= 0 && idx == keySlot)
 						? 0x00000000u
 						: (idx < colors.size() ? (colors[idx] | 0xFF000000u) : 0xFF000000u);
 				}
 			}
+			if (keySlot >= 0)
+				BleedCutoutColour(out);
 			tex.image = std::move(out);
 		}
 		else
 		{
+			tex.cutout = Texture::Cutout::None;
 			tex.image = image.convertToFormat(QImage::Format_ARGB32);
 		}
 		tex.width = tex.image.width();
@@ -467,6 +792,7 @@ namespace cso_gui
 			Texture copy;
 			copy.name = tex.name;
 			copy.flags = tex.flags;
+			copy.cutout = tex.cutout;
 			copy.width = tex.width;
 			copy.height = tex.height;
 			copy.image = tex.image.isNull()
@@ -1582,10 +1908,48 @@ namespace cso_gui
 			QImage image(tex.width, tex.height, QImage::Format_ARGB32);
 			std::vector<uint8_t> rgba(static_cast<size_t>(tex.width) * tex.height * 4);
 			DecompressBC7(Ptr(index), tex.width, tex.height, rgba.data());
+
+			// Version 2026 files normally keep a real alpha channel: deimos_zombi_host
+			// has thousands of fully transparent texels and needs no colour key.
+			// resident_zombi_origin is the other kind - it was converted from 8-bit
+			// art whose cut-out was the palette key colour, and the BC7 alpha came
+			// out opaque. The newer CSO pipeline uses pure cyan for that key (the
+			// cyan outline around the seams of the clothing atlas, which the mesh
+			// does sample), so recover the holes the way the client must: only
+			// when the masked flag is set and there is no genuine transparency.
+			tex.cutout = Texture::Cutout::None;
+			if ((tex.flags & 0x40) != 0)
+			{
+				const size_t pixelCount = static_cast<size_t>(tex.width) * tex.height;
+				bool hasAlpha = false;
+				for (size_t p = 0; p < pixelCount && !hasAlpha; ++p)
+					hasAlpha = rgba[p * 4 + 3] < 128;
+				if (!hasAlpha)
+				{
+					bool keyedCyan = false;
+					for (size_t p = 0; p < pixelCount; ++p)
+					{
+						// BC7 stores the key colour lossily, so match near-cyan
+						// rather than only the exact (0, 255, 255) value.
+						if (rgba[p * 4 + 0] <= 64 && rgba[p * 4 + 1] >= 224 &&
+							rgba[p * 4 + 2] >= 224)
+						{
+							rgba[p * 4 + 3] = 0;
+							keyedCyan = true;
+						}
+					}
+					if (keyedCyan)
+						tex.cutout = Texture::Cutout::CyanChroma;
+				}
+			}
+
 			uint32_t *dst = reinterpret_cast<uint32_t *>(image.bits());
 			for (size_t p = 0, n = static_cast<size_t>(tex.width) * tex.height; p < n; ++p)
 				dst[p] = (uint32_t(rgba[p * 4 + 3]) << 24) | (uint32_t(rgba[p * 4 + 0]) << 16) |
 					(uint32_t(rgba[p * 4 + 1]) << 8) | uint32_t(rgba[p * 4 + 2]);
+
+			if (tex.cutout == Texture::Cutout::CyanChroma)
+				BleedCutoutColour(image);
 
 			tex.image = std::move(image);
 			textures_.push_back(std::move(tex));

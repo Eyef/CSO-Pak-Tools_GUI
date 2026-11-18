@@ -82,6 +82,8 @@ private slots:
 	void OnModelPlayToggled(bool play);
 	void OnModelWireframeToggled(bool enabled);
 	void OnBspWireframeToggled(bool enabled);
+	void OnSaveModelScreenshot();
+	void OnSaveBspScreenshot();
 	void OnModelTextureChanged(int index);
 	void ExportModelTexture();
 	void OnModelForceAdditiveToggled(bool checked);
@@ -98,6 +100,9 @@ private slots:
 
 private:
 	void BuildUi();
+	// Asks for a .png path (remembering the folder) and writes the image.
+	void SaveScreenshotImage(const QImage &image, const QString &suggestedBaseName,
+		const QString &dialogTitle);
 	void BuildMenusAndToolbar();
 	void LoadPak(const QString &path);
 	// autoNar: also pull sibling/parent .nar archives in (CSO keeps models
@@ -330,6 +335,7 @@ private:
 	QComboBox *modelCameraCombo_ = nullptr;
 	QDoubleSpinBox *modelFovSpin_ = nullptr;
 	std::shared_ptr<cso_gui::StudioModel> currentModel_;
+	QString modelScreenshotBase_;  // suggested screenshot name (file name without extension)
 	// Parallel to currentModel_->Textures(): archive path a texture was
 	// resolved from (empty = still embedded/unresolved). Rebuilt fresh by
 	// ResolveExternalTextures every time a new .mdl loads.
@@ -365,6 +371,7 @@ private:
 	QLabel *bspInfoLabel_ = nullptr;
 	QCheckBox *bspWireframeCheck_ = nullptr;
 	std::shared_ptr<cso_gui::BspMap> currentBsp_;
+	QString bspScreenshotBase_;
 	// Neighbouring .pak files auto-opened while resolving BSP .wad textures
 	// in single-pak mode, plus parsed .wad images. Session caches, cleared
 	// whenever a new archive set is loaded.

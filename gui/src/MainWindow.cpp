@@ -445,6 +445,10 @@ void MainWindow::BuildUi()
 	auto *resetViewButton = new QPushButton(tr("Reset View (camera)"));
 	connect(resetViewButton, &QPushButton::clicked, this, [this]() { modelView_->ResetView(); });
 
+	auto *saveModelShotButton = new QPushButton(tr("Save screenshot (PNG)\u2026"));
+	saveModelShotButton->setToolTip(tr("Save the current view as a PNG with a transparent background (the model only)"));
+	connect(saveModelShotButton, &QPushButton::clicked, this, &MainWindow::OnSaveModelScreenshot);
+
 	// Lighting controls are deliberately a *persistent* panel (built once,
 	// here) rather than living inside modelControlsContainer_, which gets
 	// torn down and rebuilt from scratch every time a different model
@@ -477,6 +481,7 @@ void MainWindow::BuildUi()
 	modelRightPanelLayout->setContentsMargins(0, 0, 0, 0);
 	modelRightPanelLayout->addWidget(modelCameraBox_);
 	modelRightPanelLayout->addWidget(resetViewButton);
+	modelRightPanelLayout->addWidget(saveModelShotButton);
 	modelRightPanelLayout->addWidget(lightBox);
 	modelRightPanelLayout->addWidget(modelControlsScroll, 1);
 
@@ -548,6 +553,10 @@ void MainWindow::BuildUi()
 	auto *bspResetViewButton = new QPushButton(tr("Reset View (camera)"));
 	connect(bspResetViewButton, &QPushButton::clicked, this, [this]() { bspView_->ResetView(); });
 
+	auto *bspSaveShotButton = new QPushButton(tr("Save screenshot (PNG)\u2026"));
+	bspSaveShotButton->setToolTip(tr("Save what the map view shows right now as a PNG"));
+	connect(bspSaveShotButton, &QPushButton::clicked, this, &MainWindow::OnSaveBspScreenshot);
+
 	auto *bspCameraCombo = new QComboBox;
 	bspCameraCombo->addItem(tr("Orbit"));
 	bspCameraCombo->addItem(tr("Fly (WASD)"));
@@ -607,6 +616,7 @@ void MainWindow::BuildUi()
 	auto *bspRightPanelLayout = new QVBoxLayout(bspRightPanel);
 	bspRightPanelLayout->setContentsMargins(0, 0, 0, 0);
 	bspRightPanelLayout->addWidget(bspResetViewButton);
+	bspRightPanelLayout->addWidget(bspSaveShotButton);
 	bspRightPanelLayout->addWidget(bspCameraCombo);
 	// The "Plain (like goldsrc-bsp-viewer)" switch is disabled: the
 	// "Model light boost" slider reproduces it. To bring it back, set
@@ -2749,6 +2759,7 @@ void MainWindow::ShowModel(const FoundEntry &ref, const std::vector<uint8_t> &da
 	const QString fileName = ref.fileName();
 	const bool firstPerson = fileName.startsWith(QStringLiteral("v_"), Qt::CaseInsensitive);
 	currentModel_ = model;
+	modelScreenshotBase_ = QFileInfo(fileName).completeBaseName();
 	modelView_->SetModel(model, firstPerson);
 	modelCameraCombo_->blockSignals(true);
 	modelCameraCombo_->setCurrentIndex(firstPerson ? 1 : 0);
@@ -4034,12 +4045,11 @@ void MainWindow::OnModelTextureChanged(int index)
 	modelTexturePreview_->setPixmap(pixmap);
 
 	// GoldSource studiomdl STUDIO_NF_* texture flags. Shown mainly so a
-	// texture that renders as a solid black plane in this simple viewer
-	// (no alpha blending beyond the "masked" cutout the parser already
-	// applies) can be told apart from one that's genuinely just black --
-	// e.g. a texture flagged "additive" is meant to be blended, not drawn
-	// opaquely, which this viewer doesn't do; that's a likely explanation
-	// for particle-effect meshes showing as solid black panels.
+	// texture that renders as a solid plane can be told apart from one that's
+	// genuinely just flat: e.g. a texture flagged "additive" is drawn with the
+	// additive pass (see ModelViewWidget), and "masked" marks the usual
+	// palette-index-255 cut-out (which the parser also applies when the flag
+	// is missing - the note below says so).
 	QStringList flags;
 	if (tex.flags & 0x1) flags << QStringLiteral("flatshade");
 	if (tex.flags & 0x2) flags << QStringLiteral("chrome");
@@ -4048,6 +4058,25 @@ void MainWindow::OnModelTextureChanged(int index)
 	if (tex.flags & 0x20) flags << QStringLiteral("additive");
 	if (tex.flags & 0x40) flags << QStringLiteral("masked");
 	QString flagsText = flags.isEmpty() ? tr("none") : flags.join(QStringLiteral(", "));
+
+	// Some textures are cut out by a colour key that the file does not declare
+	// with the masked flag. Say so, otherwise "flags: none" looks like the
+	// transparent parts are a viewer bug.
+	switch (tex.cutout)
+	{
+	case cso_gui::StudioModel::Texture::Cutout::InferredIndex:
+		flagsText += tr(" (cut-out: palette index 255, flag not set)");
+		break;
+	case cso_gui::StudioModel::Texture::Cutout::InferredChroma:
+		flagsText += tr(" (cut-out: key colour moved off palette index 255)");
+		break;
+	case cso_gui::StudioModel::Texture::Cutout::CyanChroma:
+		flagsText += tr(" (cut-out: cyan chroma key)");
+		break;
+	case cso_gui::StudioModel::Texture::Cutout::MaskedIndex:
+	case cso_gui::StudioModel::Texture::Cutout::None:
+		break;
+	}
 
 	// Note when additive rendering is in effect for a reason other than the
 	// file's own flag: the "$0a_"/"$0b_" name-prefix heuristic, or a manual
@@ -4207,7 +4236,13 @@ void MainWindow::ExportModelTexture()
 	QImage toSave = texture.image;
 	if (format == "BMP")
 	{
-		const QImage paletted = BuildPalettedImage(texture.image, (texture.flags & 0x40) != 0);
+		// Treat a texture as masked for export when the parser keyed a cut-out
+		// for it, even if the file's own flag was missing (see
+		// StudioModel::ParseTextures): the paletted BMP keeps the hole in slot
+		// 255, which the game and this viewer both read back.
+		const bool maskedForExport = (texture.flags & 0x40) != 0 ||
+			texture.cutout != cso_gui::StudioModel::Texture::Cutout::None;
+		const QImage paletted = BuildPalettedImage(texture.image, maskedForExport);
 		if (!paletted.isNull())
 			toSave = paletted;
 	}
@@ -4232,6 +4267,74 @@ void MainWindow::OnModelForceAdditiveToggled(bool checked)
 void MainWindow::OnModelWireframeToggled(bool enabled)
 {
 	modelView_->SetWireframe(enabled);
+}
+
+void MainWindow::SaveScreenshotImage(const QImage &image, const QString &suggestedBaseName,
+	const QString &dialogTitle)
+{
+	QSettings settings;
+	const QString lastDir = settings.value(QStringLiteral("screenshotDir")).toString();
+	const QString baseName = suggestedBaseName.isEmpty() ? tr("screenshot") : suggestedBaseName;
+	const QString suggested = lastDir.isEmpty()
+		? baseName + QStringLiteral(".png")
+		: QDir(lastDir).filePath(baseName + QStringLiteral(".png"));
+
+	QString path = QFileDialog::getSaveFileName(this, dialogTitle, suggested,
+		tr("PNG image (*.png)"));
+	if (path.isEmpty())
+		return;
+
+	// Whatever the user typed, the content is a PNG: make the extension agree.
+	const QFileInfo selected(path);
+	if (selected.suffix().compare(QStringLiteral("png"), Qt::CaseInsensitive) != 0)
+		path = QDir(selected.path()).filePath(selected.fileName() + QStringLiteral(".png"));
+
+	if (!image.save(path, "PNG"))
+	{
+		QMessageBox::warning(this, dialogTitle,
+			tr("Failed to save the screenshot to:\n%1").arg(path));
+		return;
+	}
+
+	settings.setValue(QStringLiteral("screenshotDir"), QFileInfo(path).absolutePath());
+	statusBar()->showMessage(tr("Screenshot saved to %1").arg(path), 5000);
+}
+
+void MainWindow::OnSaveModelScreenshot()
+{
+	if (!currentModel_)
+	{
+		statusBar()->showMessage(tr("No model is loaded."), 5000);
+		return;
+	}
+
+	// Captured at click time, before the file dialog opens.
+	const QImage image = modelView_->GrabTransparentImage();
+	if (image.isNull())
+	{
+		QMessageBox::warning(this, tr("Save model screenshot"),
+			tr("Could not render the model to an image."));
+		return;
+	}
+	SaveScreenshotImage(image, modelScreenshotBase_, tr("Save model screenshot"));
+}
+
+void MainWindow::OnSaveBspScreenshot()
+{
+	if (!currentBsp_)
+	{
+		statusBar()->showMessage(tr("No map is loaded."), 5000);
+		return;
+	}
+
+	const QImage image = bspView_->GrabScreenshot();
+	if (image.isNull())
+	{
+		QMessageBox::warning(this, tr("Save map screenshot"),
+			tr("Could not grab the map view."));
+		return;
+	}
+	SaveScreenshotImage(image, bspScreenshotBase_, tr("Save map screenshot"));
 }
 
 void MainWindow::OnBspWireframeToggled(bool enabled)
@@ -5439,6 +5542,7 @@ void MainWindow::ShowBsp(const FoundEntry &ref, const std::vector<uint8_t> &data
 			missingCount > missingNames.size() ? QStringLiteral(", ...") : QString());
 	bspInfoLabel_->setText(info);
 
+	bspScreenshotBase_ = QFileInfo(ref.fileName()).completeBaseName();
 	stack_->setCurrentWidget(bspPageContainer_);
 }
 

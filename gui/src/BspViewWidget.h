@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QOpenGLBuffer>
+#include <QImage>
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLTexture>
@@ -154,6 +155,11 @@ namespace cso_gui
 		CameraMode GetCameraMode() const { return cameraMode_; }
 
 		size_t TriangleCount() const { return triangleCount_; }
+
+		// Snapshot of what the view shows right now (camera, lighting, sky,
+		// wireframe...) at the widget's size in device pixels, as an opaque
+		// image. Does not change anything about how the map is rendered.
+		QImage GrabScreenshot();
 
 	signals:
 		// Diagnostic line for the status bar while PVS culling is on: camera

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QOpenGLBuffer>
+#include <QImage>
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLTexture>
@@ -123,6 +124,16 @@ namespace cso_gui
 		bool ModelBounds(float &minX, float &minY, float &minZ,
 			float &maxX, float &maxY, float &maxZ) const;
 
+		// Renders the model exactly as currently shown (same camera, pose, skin,
+		// bodygroups, lighting, wireframe) into an offscreen buffer with a fully
+		// transparent background -- only the model itself, no grey backdrop.
+		// Antialiased (MSAA when available); the result is a straight-alpha
+		// QImage::Format_RGBA8888 of the widget's size in device pixels, ready
+		// for PNG. Additive/glow meshes become partially transparent light, so
+		// they stay correct over any background. Returns a null image when no
+		// model is loaded or rendering failed.
+		QImage GrabTransparentImage();
+
 	protected:
 		void initializeGL() override;
 		void paintGL() override;
@@ -145,6 +156,11 @@ namespace cso_gui
 		};
 
 		void BuildGpuMeshes();
+		// Draws the model into the currently bound framebuffer (no clear).
+		// capture = true writes an alpha channel suited to a transparent
+		// screenshot (see GrabTransparentImage); false is the normal on-screen
+		// look.
+		void DrawScene(bool capture);
 		void SetupMatrices(int width, int height);
 		void ComputeBounds(bool resetDistance);
 		void LeaveFirstPerson();
@@ -169,8 +185,9 @@ namespace cso_gui
 		int useTexLoc_ = -1;
 		int chromeLoc_ = -1;
 		int colorLoc_ = -1;
+		int alphaModeLoc_ = -1;
 
-		std::vector<int> bodyGroup_;  // selected submodel per bodypart
+		std::vector<int> bodyGroup_; // selected submodel per bodypart
 		int activeBodyPart_ = 0;      // bodypart whose group is being edited
 		int skinFamily_ = 0;
 		int sequenceIndex_ = -1;      // -1 = rest pose

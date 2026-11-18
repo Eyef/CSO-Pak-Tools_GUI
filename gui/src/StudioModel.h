@@ -117,11 +117,26 @@ namespace cso_gui
 
 		struct Texture
 		{
+			// How the parser made texels transparent. CSO textures key their
+			// cut-outs by palette index or by a chroma colour, not by an alpha
+			// channel, and the MDL's "masked" flag is not always set for them.
+			enum class Cutout
+			{
+				None,
+				MaskedIndex,   // flags & 0x40: palette index 255, as documented
+				InferredIndex, // no flag, but the texture still uses index 255
+				// flags & 0x40, but the key colour was re-quantised to another
+				// palette slot and index 255 is unused (newer CSO models)
+				InferredChroma,
+				CyanChroma,    // v2026 texture keyed by the cyan chroma colour
+			};
+
 			std::string name;
 			int flags = 0;
 			int width = 0;
 			int height = 0;
 			QImage image;  // ARGB32
+			Cutout cutout = Cutout::None;
 		};
 
 		struct Sequence

@@ -2082,6 +2082,25 @@ void main()
 		program_->release();
 	}
 
+	QImage BspViewWidget::GrabScreenshot()
+	{
+		// grabFramebuffer() renders the current frame and returns it as
+		// premultiplied ARGB. Translucent passes can leave alpha below 1 in the
+		// buffer, so drop it: a screenshot of a level has no transparency.
+		const QImage grabbed = grabFramebuffer().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+		if (grabbed.isNull())
+			return QImage();
+		QImage opaque(grabbed.size(), QImage::Format_RGB32);
+		for (int y = 0; y < grabbed.height(); ++y)
+		{
+			const QRgb *src = reinterpret_cast<const QRgb *>(grabbed.constScanLine(y));
+			QRgb *dst = reinterpret_cast<QRgb *>(opaque.scanLine(y));
+			for (int x = 0; x < grabbed.width(); ++x)
+				dst[x] = 0xFF000000u | (src[x] & 0x00FFFFFFu);
+		}
+		return opaque;
+	}
+
 	void BspViewWidget::resizeGL(int w, int h)
 	{
 		glViewport(0, 0, w, h);

@@ -2,6 +2,8 @@
 
 #include <QMatrix4x4>
 #include <QMouseEvent>
+#include <QOpenGLFramebufferObject>
+#include <QOpenGLFramebufferObjectFormat>
 #include <QWheelEvent>
 #include <QVector2D>
 #include <QVector3D>
@@ -9,6 +11,12 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+
+// GL_MAX (blend equation) is GL 1.4 and not exposed by every platform's
+// base GL header (Windows' gl.h is 1.1).
+#ifndef GL_MAX
+#define GL_MAX 0x8008
+#endif
 
 namespace cso_gui
 {
@@ -48,6 +56,11 @@ uniform vec3 uFillLightDir;
 uniform vec4 uColor;
 uniform float uUnlit;
 uniform float uChrome;
+// 0 = normal on-screen output (alpha = texture alpha);
+// 1 = transparent-screenshot opaque pass (alpha forced to 1);
+// 2 = transparent-screenshot additive pass: premultiplied light, with alpha
+//     = its brightest channel (blended with GL_MAX on alpha).
+uniform float uAlphaMode;
 out vec4 FragColor;
 void main()
 {
@@ -70,7 +83,15 @@ void main()
 	// them at their own texture brightness instead of modulating by scene
 	// lighting, which would incorrectly dim or tint them.
 	vec3 shaded = mix(base.rgb * light, base.rgb, uUnlit);
-	FragColor = vec4(shaded, base.a);
+	if (uAlphaMode > 1.5)
+	{
+		vec3 glow = shaded * base.a;
+		FragColor = vec4(glow, max(glow.r, max(glow.g, glow.b)));
+	}
+	else if (uAlphaMode > 0.5)
+		FragColor = vec4(shaded, 1.0);
+	else
+		FragColor = vec4(shaded, base.a);
 }
 )";
 	}
@@ -528,6 +549,7 @@ void main()
 		texLoc_ = program_->uniformLocation("uTexture");
 		useTexLoc_ = program_->uniformLocation("uUseTex");
 		colorLoc_ = program_->uniformLocation("uColor");
+		alphaModeLoc_ = program_->uniformLocation("uAlphaMode");
 	}
 
 	void ModelViewWidget::BuildGpuMeshes()
@@ -764,7 +786,13 @@ void main()
 
 	void ModelViewWidget::paintGL()
 	{
+		glClearColor(0.16f, 0.18f, 0.20f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		DrawScene(false);
+	}
+
+	void ModelViewWidget::DrawScene(bool capture)
+	{
 		// Resetting a potentially stuck state from Qt/driver
 		glDisable(GL_BLEND);
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -782,6 +810,7 @@ void main()
 		SetupMatrices(width(), height());
 
 		program_->bind();
+		program_->setUniformValue(alphaModeLoc_, capture ? 1.0f : 0.0f);
 		program_->setUniformValue(useTexLoc_, wireframe_ ? 0.0f : 1.0f);
 		program_->setUniformValue(colorLoc_, QVector4D(0.7f, 0.7f, 0.7f, 1.0f));
 		program_->setUniformValue(unlitLoc_, 0.0f);
@@ -828,9 +857,21 @@ void main()
 		if (hasAdditive)
 		{
 			glEnable(GL_BLEND);
-			glBlendFunc(GL_SRC_ALPHA, GL_ONE);
 			glDepthMask(GL_FALSE);
 			program_->setUniformValue(unlitLoc_, 1.0f);
+			if (capture)
+			{
+				// Into a transparent buffer: add the light to the colour like
+				// on screen, but keep the brightest alpha instead of summing it,
+				// so overlapping glows can't push alpha past what they emit.
+				glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
+				glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
+				program_->setUniformValue(alphaModeLoc_, 2.0f);
+			}
+			else
+			{
+				glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+			}
 
 			for (const auto &gpu : meshes_)
 			{
@@ -844,6 +885,12 @@ void main()
 			}
 
 			program_->setUniformValue(unlitLoc_, 0.0f);
+			program_->setUniformValue(alphaModeLoc_, capture ? 1.0f : 0.0f);
+			if (capture)
+			{
+				glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+				glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			}
 			glDepthMask(GL_TRUE);
 			glDisable(GL_BLEND);
 		}
@@ -855,6 +902,97 @@ void main()
 		}
 
 		program_->release();
+	}
+
+	QImage ModelViewWidget::GrabTransparentImage()
+	{
+		if (!model_ || !program_ || !isValid())
+			return QImage();
+
+		const qreal dpr = devicePixelRatioF();
+		const QSize size(std::max(1, qRound(width() * dpr)),
+			std::max(1, qRound(height() * dpr)));
+
+		makeCurrent();
+
+		QImage result;
+		{
+			// Render into our own FBO instead of the widget's: its alpha is
+			// composited against the window, so it can't carry transparency.
+			// 4x MSAA (resolved below) gives smooth edges on the cut-out.
+			QOpenGLFramebufferObjectFormat format;
+			format.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
+			format.setInternalTextureFormat(GL_RGBA8);
+			QOpenGLFramebufferObjectFormat msaaFormat = format;
+			msaaFormat.setSamples(4);
+
+			auto renderFbo = std::make_unique<QOpenGLFramebufferObject>(size, msaaFormat);
+			if (!renderFbo->isValid())
+				renderFbo = std::make_unique<QOpenGLFramebufferObject>(size, format); // No MSAA support.
+			QOpenGLFramebufferObject resolveFbo(size, format);
+
+			if (renderFbo->isValid() && resolveFbo.isValid())
+			{
+				if (!gpuBuilt_)
+				{
+					BuildGpuMeshes();
+					gpuBuilt_ = true;
+				}
+
+				renderFbo->bind();
+				glViewport(0, 0, size.width(), size.height());
+				glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+				glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+				DrawScene(true);
+
+				// Resolve MSAA (a plain blit also works when it isn't multisampled).
+				QOpenGLFramebufferObject::blitFramebuffer(&resolveFbo, renderFbo.get(),
+					GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+				resolveFbo.bind();
+				std::vector<uchar> pixels(static_cast<size_t>(size.width()) * size.height() * 4);
+				glPixelStorei(GL_PACK_ALIGNMENT, 1);
+				glReadPixels(0, 0, size.width(), size.height(), GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+
+				// The buffer holds premultiplied colour (opaque pixels have alpha
+				// 1; glows add light and the brightest-channel alpha). Convert to
+				// straight alpha for PNG, flipping from GL's bottom-up rows.
+				// Alpha is raised to the brightest colour channel first, so
+				// overlapping glows (colour summed, alpha maxed) can't overflow.
+				result = QImage(size, QImage::Format_RGBA8888);
+				for (int y = 0; y < size.height(); ++y)
+				{
+					const uchar *src = pixels.data()
+						+ static_cast<size_t>(size.height() - 1 - y) * size.width() * 4;
+					uchar *dst = result.scanLine(y);
+					for (int x = 0; x < size.width(); ++x, src += 4, dst += 4)
+					{
+						const int a = std::max({ static_cast<int>(src[3]),
+							static_cast<int>(src[0]), static_cast<int>(src[1]),
+							static_cast<int>(src[2]) });
+						if (a == 0)
+						{
+							dst[0] = dst[1] = dst[2] = dst[3] = 0;
+							continue;
+						}
+						dst[0] = static_cast<uchar>(std::min(255, (src[0] * 255 + a / 2) / a));
+						dst[1] = static_cast<uchar>(std::min(255, (src[1] * 255 + a / 2) / a));
+						dst[2] = static_cast<uchar>(std::min(255, (src[2] * 255 + a / 2) / a));
+						dst[3] = static_cast<uchar>(a);
+					}
+				}
+				result.setDevicePixelRatio(1.0);
+
+				resolveFbo.release();
+			}
+		}
+
+		// Hand the context back in the state paintGL expects.
+		glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+		glViewport(0, 0, qRound(width() * dpr), qRound(height() * dpr));
+		doneCurrent();
+		update();
+		return result;
 	}
 
 	void ModelViewWidget::resizeGL(int w, int h)
